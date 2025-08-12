@@ -19,6 +19,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.device_registry import DeviceInfo
 
 from . import DOMAIN  # Import DOMAIN from __init__.py
 from easunpy.async_isolar import AsyncISolar
@@ -142,6 +143,17 @@ class EasunSensor(SensorEntity):
         """Return the unit of measurement."""
         return self._unit
 
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device information."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, "easun_inverter")},
+            name="Easun Inverter",
+            manufacturer="Easun",
+            model=self._collector._isolar.model,
+            sw_version="1.0",  # You can make this dynamic if needed
+        )
+
     def update_from_collector(self):
         """Update the sensor state from the data collector."""
         value = self._collector.get_data(self._section, self._key)
@@ -170,6 +182,15 @@ class RegisterScanSensor(SensorEntity):
         if DOMAIN in self._hass.data and "register_scan" in self._hass.data[DOMAIN]:
             return self._hass.data[DOMAIN]["register_scan"]
         return None
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device information."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, "easun_inverter")},
+            name="Easun Inverter",
+            manufacturer="Easun",
+        )
 
     def update(self):
         """Update the sensor."""
@@ -200,6 +221,15 @@ class DeviceScanSensor(SensorEntity):
             return self._hass.data[DOMAIN]["device_scan"]
         return None
 
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device information."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, "easun_inverter")},
+            name="Easun Inverter",
+            manufacturer="Easun",
+        )
+
     def update(self):
         """Update the sensor."""
         if DOMAIN in self._hass.data and "device_scan" in self._hass.data[DOMAIN]:
@@ -213,7 +243,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, add_
     inverter_ip = config_entry.data["inverter_ip"]
     local_ip = config_entry.data["local_ip"]
     model = config_entry.data["model"]
-    scan_interval = config_entry.data.get("scan_interval", DEFAULT_SCAN_INTERVAL)
+    scan_interval = config_entry.options.get("scan_interval", config_entry.data.get("scan_interval", DEFAULT_SCAN_INTERVAL))
     
     isolar = AsyncISolar(inverter_ip, local_ip, model)
     data_collector = DataCollector(isolar)
