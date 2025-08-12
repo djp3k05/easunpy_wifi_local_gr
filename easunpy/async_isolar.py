@@ -11,8 +11,8 @@ from .models import MODEL_CONFIGS, ModelConfig
 logger = logging.getLogger(__name__)
 
 class AsyncISolar:
-    def __init__(self, inverter_ip: str, local_ip: str, model: str = "ISOLAR_SMG_II_11K"):
-        self.client = AsyncModbusClient(inverter_ip=inverter_ip, local_ip=local_ip)
+    def __init__(self, inverter_ip: str, local_ip: str, model: str = "ISOLAR_SMG_II_11K", port: int = 8899):
+        self.client = AsyncModbusClient(inverter_ip=inverter_ip, local_ip=local_ip, port=port)
         self._transaction_id = 0x0772
         
         if model not in MODEL_CONFIGS:
@@ -20,7 +20,8 @@ class AsyncISolar:
         
         self.model = model
         self.model_config = MODEL_CONFIGS[model]
-        logger.warning(f"AsyncISolar initialized with model: {model}")
+        self.port = port  # Store port for reference
+        logger.warning(f"AsyncISolar initialized with model: {model} on port {port}")
 
     def update_model(self, model: str):
         """Update the model configuration."""
@@ -93,20 +94,23 @@ class AsyncISolar:
         # From QPIGS
         if len(qpigs_parts) >= 21:
             values["grid_voltage"] = float(qpigs_parts[0])
-            values["grid_frequency"] = float(qpigs_parts[1])
+            values["grid_frequency"] = float(qpigs_parts[1]) * 100  # Scale to match Modbus raw (e.g., 50.0 -> 5000)
             values["output_voltage"] = float(qpigs_parts[2])
-            values["output_frequency"] = float(qpigs_parts[3])
+            values["output_frequency"] = float(qpigs_parts[3]) * 100  # Scale to match Modbus raw
             values["output_apparent_power"] = int(qpigs_parts[4])
             values["output_power"] = int(qpigs_parts[5])
             values["output_load_percentage"] = int(qpigs_parts[6])
             values["battery_voltage"] = float(qpigs_parts[8])
             battery_charging_current = int(qpigs_parts[9])
             values["battery_soc"] = int(qpigs_parts[10])
-            values["battery_temperature"] = int(qpigs_parts[11])
+            inverter_heat_sink_temp = int(qpigs_parts[11])
             pv_charging_current = float(qpigs_parts[12])
             pv1_voltage = float(qpigs_parts[13])
             battery_discharge_current = int(qpigs_parts[15])
             pv_charging_power = int(qpigs_parts[19])
+            # Set temperatures (use inverter heat sink for both, as no separate PV temp in QPIGS)
+            values["battery_temperature"] = inverter_heat_sink_temp
+            values["pv_temperature"] = inverter_heat_sink_temp
             # PV
             values["pv_charging_current"] = pv_charging_current
             values["pv1_voltage"] = pv1_voltage
@@ -114,7 +118,6 @@ class AsyncISolar:
             values["pv1_current"] = pv_charging_power / pv1_voltage if pv1_voltage > 0 else 0
             values["pv_total_power"] = pv_charging_power
             values["pv_charging_power"] = pv_charging_power
-            values["pv_temperature"] = values["battery_temperature"]
             # Battery current and power
             values["battery_current"] = battery_charging_current - battery_discharge_current
             values["battery_power"] = int(values["battery_voltage"] * values["battery_current"])
@@ -138,7 +141,7 @@ class AsyncISolar:
                 values["pv2_voltage"] = 0.0
                 values["pv2_current"] = 0.0
                 values["pv2_power"] = 0
-            # No energy stats
+            # No energy stats available from QPIGS/QPIGS2
             values["pv_energy_today"] = None
             values["pv_energy_total"] = None
         else:
