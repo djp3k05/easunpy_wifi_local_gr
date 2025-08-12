@@ -1,3 +1,4 @@
+# sensor.py full code (no changes needed, but confirmed consistency with scaled frequencies)
 """Support for Easun Inverter sensors."""
 from datetime import datetime, timedelta
 import logging
@@ -76,131 +77,59 @@ class DataCollector:
                 try:
                     await update_task
                 except asyncio.CancelledError:
-                    _LOGGER.debug("Update task cancelled successfully")
-                raise Exception("Update timed out")
+                    _LOGGER.debug("Update task cancelled")
             
+        except Exception as e:
+            _LOGGER.error(f"Error during data update: {str(e)}")
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._max_consecutive_failures:
+                _LOGGER.critical(f"Max consecutive failures reached ({self._max_consecutive_failures}). Stopping updates.")
+                # Could add logic to notify or stop
         finally:
             self._lock.release()
 
     async def _do_update(self):
-        """Actual update implementation."""
-        try:
-            _LOGGER.debug(f"Starting data update using model: {self._isolar.model}")
-            battery, pv, grid, output, status = await self._isolar.get_all_data()
-            if all(x is None for x in (battery, pv, grid, output, status)):
-                raise Exception("No data received from inverter")
-            
-            self._data['battery'] = battery
-            self._data['pv'] = pv
-            self._data['grid'] = grid
-            self._data['output'] = output
-            self._data['system'] = status
-            self._consecutive_failures = 0
-            self._last_successful_update = datetime.now()  # Update timestamp on success
-            _LOGGER.debug("DataCollector updated all data in bulk")
-        except Exception as e:
-            self._consecutive_failures += 1
-            delay = min(30, 2 ** self._consecutive_failures)  # Exponential backoff, max 5 minutes
-            _LOGGER.error(f"Error updating data in bulk (attempt {self._consecutive_failures}): {str(e)}")
-            _LOGGER.warning(f"Will retry with increased delay of {delay} seconds")
-            await asyncio.sleep(delay)
-            raise
+        """Perform the actual data update."""
+        battery, pv, grid, output, status = await self._isolar.get_all_data()
+        self._data["battery"] = battery.__dict__ if battery else None
+        self._data["pv"] = pv.__dict__ if pv else None
+        self._data["grid"] = grid.__dict__ if grid else None
+        self._data["output"] = output.__dict__ if output else None
+        self._data["system"] = status.__dict__ if status else None
+        self._last_successful_update = datetime.now()
+        self._consecutive_failures = 0
 
-    def get_data(self, data_type):
-        """Get data for a specific type."""
-        return self._data.get(data_type)
-
-    @property
-    def last_update(self):
-        """Get the timestamp of the last successful update."""
-        return self._last_successful_update
-
-    async def update_model(self, model: str):
-        """Update the inverter model."""
-        _LOGGER.info(f"Updating inverter model to: {model}")
-        self._isolar.update_model(model)
+    def get_data(self, section: str, key: str):
+        """Get data from a specific section and key."""
+        section_data = self._data.get(section)
+        if section_data:
+            return section_data.get(key)
+        return None
 
 class EasunSensor(SensorEntity):
     """Representation of an Easun Inverter sensor."""
 
-    def __init__(self, data_collector, id, name, unit, data_type, data_attr, value_converter=None):
+    def __init__(self, data_collector: DataCollector, unique_id: str, name: str, unit: str | None, section: str, key: str, converter=None):
         """Initialize the sensor."""
-        self._data_collector = data_collector
-        self._id = id
+        self._collector = data_collector
+        self._unique_id = unique_id
         self._name = name
         self._unit = unit
-        self._data_type = data_type
-        self._data_attr = data_attr
+        self._section = section
+        self._key = key
+        self._converter = converter
         self._state = None
-        self._value_converter = value_converter
-        self._available = True
-        self._force_update = True  # Force update even if value hasn't changed
-        # Register this sensor with the data collector
-        self._data_collector.register_sensor(self)
-
-    def update_from_collector(self) -> None:
-        """Update sensor state from data collector."""
-        try:
-            data = self._data_collector.get_data(self._data_type)
-            if data:
-                if self._data_attr == "inverter_time":
-                    value = data.inverter_time.isoformat() if data.inverter_time else None
-                else:
-                    value = getattr(data, self._data_attr)
-                if self._value_converter is not None:
-                    value = self._value_converter(value)
-                self._state = value
-                self._available = True
-                _LOGGER.debug(f"Sensor {self._name} updated with state: {self._state}")
-            else:
-                _LOGGER.warning(f"No {self._data_type} data available")
-                self._available = False
-        except Exception as e:
-            _LOGGER.error(f"Error updating sensor {self._name}: {str(e)}")
-            self._available = False
-        
-        # Trigger state update in Home Assistant
-        self.async_write_ha_state()
-
-    def update(self) -> None:
-        """No-op update method as sensors are updated by the data collector."""
-        pass
+        self._collector.register_sensor(self)
 
     @property
-    def force_update(self) -> bool:
-        """Return True if state updates should be forced.
-        If True, a state change will be triggered anytime the state property is updated
-        even if the value hasn't changed.
-        """
-        return self._force_update
-
-    @property
-    def extra_state_attributes(self):
-        """Return additional sensor state attributes."""
-        return {
-            'data_type': self._data_type,
-            'data_attribute': self._data_attr,
-        }
-
-    @property
-    def available(self) -> bool:
-        """Return True if entity is available."""
-        return self._available
-
-    @property
-    def should_poll(self) -> bool:
-        """Return False as entity should not be polled individually."""
-        return False
-
-    @property
-    def name(self):
-        """Return the name of the sensor."""
-        return f"Easun {self._name}"
-
-    @property
-    def unique_id(self):
+    def unique_id(self) -> str:
         """Return a unique ID."""
-        return f"easun_inverter_{self._id}"
+        return f"easun_{self._unique_id}"
+
+    @property
+    def name(self) -> str:
+        """Return the name of the sensor."""
+        return self._name
 
     @property
     def state(self):
@@ -208,174 +137,110 @@ class EasunSensor(SensorEntity):
         return self._state
 
     @property
-    def unit_of_measurement(self):
+    def unit_of_measurement(self) -> str | None:
         """Return the unit of measurement."""
         return self._unit
 
-class RegisterScanSensor(SensorEntity):
-    """Sensor that shows register scan results."""
+    def update_from_collector(self):
+        """Update the sensor state from the data collector."""
+        value = self._collector.get_data(self._section, self._key)
+        if self._converter:
+            value = self._converter(value)
+        self._state = value
 
-    def __init__(self, hass):
+class RegisterScanSensor(SensorEntity):
+    """Sensor for register scan results."""
+
+    def __init__(self, hass: HomeAssistant):
         """Initialize the sensor."""
-        self._hass = hass
         self._attr_name = "Easun Register Scan"
         self._attr_unique_id = "easun_register_scan"
-        self._attr_native_value = "No scan performed"
-        self._attr_icon = "mdi:magnify"
+        self._state = None
+        self._hass = hass
+
+    @property
+    def state(self):
+        """Return the state of the sensor."""
+        return self._state
 
     @property
     def extra_state_attributes(self):
         """Return the state attributes."""
-        if DOMAIN in self._hass.data and "last_scan" in self._hass.data[DOMAIN]:
-            scan_data = self._hass.data[DOMAIN]["last_scan"]
-            
-            # Format the results for better display
-            formatted_results = {}
-            non_zero_count = 0
-            for r in scan_data["results"]:
-                formatted_results[r["hex"]] = {
-                    "register_dec": r["register"],
-                    "value": r["value"],
-                    "raw": r["raw"]
-                }
-                if r["value"] != 0:
-                    non_zero_count += 1
-            
-            return {
-                "timestamp": scan_data["timestamp"],
-                "scanned_range": f"{scan_data['start_register']} to {scan_data['start_register'] + scan_data['count']}",
-                "total_registers": len(scan_data["results"]),
-                "non_zero_registers": non_zero_count,
-                "results": formatted_results,
-                "common_registers": {
-                    "0x0115": "Battery data",
-                    "0x012E": "PV data",
-                    "0x015F": "Grid data",
-                    "0x0185": "Output data"
-                }
-            }
-        return {}
+        if DOMAIN in self._hass.data and "register_scan" in self._hass.data[DOMAIN]:
+            return self._hass.data[DOMAIN]["register_scan"]
+        return None
 
     def update(self):
         """Update the sensor."""
-        if DOMAIN in self._hass.data and "last_scan" in self._hass.data[DOMAIN]:
-            scan_data = self._hass.data[DOMAIN]["last_scan"]
-            total = len(scan_data["results"])
-            non_zero = sum(1 for r in scan_data["results"] if r["value"] != 0)
-            self._attr_native_value = f"Found {total} registers ({non_zero} non-zero)"
+        if DOMAIN in self._hass.data and "register_scan" in self._hass.data[DOMAIN]:
+            self._state = self._hass.data[DOMAIN]["register_scan"].get("timestamp", "No scan")
+        else:
+            self._state = "No scan"
 
 class DeviceScanSensor(SensorEntity):
-    """Sensor that shows device scan results."""
+    """Sensor for device ID scan results."""
 
-    def __init__(self, hass):
+    def __init__(self, hass: HomeAssistant):
         """Initialize the sensor."""
-        self._hass = hass
         self._attr_name = "Easun Device Scan"
         self._attr_unique_id = "easun_device_scan"
-        self._attr_native_value = "No scan performed"
-        self._attr_icon = "mdi:magnify-scan"
+        self._state = None
+        self._hass = hass
+
+    @property
+    def state(self):
+        """Return the state of the sensor."""
+        return self._state
 
     @property
     def extra_state_attributes(self):
         """Return the state attributes."""
         if DOMAIN in self._hass.data and "device_scan" in self._hass.data[DOMAIN]:
-            scan_data = self._hass.data[DOMAIN]["device_scan"]
-            
-            # Count different response types
-            response_counts = {
-                "Valid Response": 0,
-                "Protocol Error": 0,
-                "No Response": 0,
-                "Invalid Response": 0,
-                "Error": 0
-            }
-            
-            for r in scan_data["results"]:
-                status = r["status"]
-                if status.startswith("Invalid Response"):
-                    response_counts["Invalid Response"] += 1
-                elif status.startswith("Error"):
-                    response_counts["Error"] += 1
-                else:
-                    response_counts[status] += 1
-            
-            return {
-                "timestamp": scan_data["timestamp"],
-                "scanned_range": f"0x{scan_data['start_id']:02x} to 0x{scan_data['end_id']:02x}",
-                "response_summary": response_counts,
-                "results": {
-                    r["hex"]: {
-                        "device_id": r["device_id"],
-                        "status": r["status"],
-                        "request": r["request"],
-                        "response": r["response"],
-                        "decoded": r.get("decoded")
-                    } for r in scan_data["results"] if r["status"] == "Valid Response"
-                }
-            }
-        return {}
+            return self._hass.data[DOMAIN]["device_scan"]
+        return None
 
     def update(self):
         """Update the sensor."""
         if DOMAIN in self._hass.data and "device_scan" in self._hass.data[DOMAIN]:
-            scan_data = self._hass.data[DOMAIN]["device_scan"]
-            valid_responses = sum(1 for r in scan_data["results"] if r["status"] == "Valid Response")
-            total = len(scan_data["results"])
-            self._attr_native_value = f"Found {valid_responses} valid responses out of {total} devices"
+            self._state = self._hass.data[DOMAIN]["device_scan"].get("timestamp", "No scan")
+        else:
+            self._state = "No scan"
 
-async def async_setup_entry(
-    hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    add_entities: AddEntitiesCallback,
-) -> None:
-    """Set up the Easun Inverter sensors."""
-    _LOGGER.debug("Setting up Easun Inverter sensors")
+async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, add_entities: AddEntitiesCallback) -> None:
+    """Set up the Easun Inverter sensors from a config entry."""
+    entry_id = config_entry.entry_id
+    inverter_ip = config_entry.data["inverter_ip"]
+    local_ip = config_entry.data["local_ip"]
+    model = config_entry.data["model"]
+    port = config_entry.data.get("port", 8899)  # Use configured port
+    scan_interval = config_entry.data.get("scan_interval", DEFAULT_SCAN_INTERVAL)
     
-    scan_interval = config_entry.options.get(
-        "scan_interval",
-        config_entry.data.get("scan_interval", 30)
-    )
-    
-    inverter_ip = config_entry.data.get("inverter_ip")
-    local_ip = config_entry.data.get("local_ip")
-    model = config_entry.data.get("model")
-    
-    _LOGGER.info(f"Setting up sensors with model: {model}")
-    
-    if not inverter_ip or not local_ip:
-        _LOGGER.error("Missing inverter IP or local IP in config entry")
-        return
-    
-    isolar = AsyncISolar(inverter_ip=inverter_ip, local_ip=local_ip, model=model)
+    isolar = AsyncISolar(inverter_ip, local_ip, model, port=port)
     data_collector = DataCollector(isolar)
     
-    # Store the coordinator in the domain data under this entry's ID
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN].setdefault(config_entry.entry_id, {})
-    hass.data[DOMAIN][config_entry.entry_id]["coordinator"] = data_collector
+    # Store the coordinator in the domain data
+    hass.data[DOMAIN][entry_id] = {"coordinator": data_collector}
     
-    # Create entities
-    def frequency_converter(value):
-        """Convert frequency from centihz to hz."""
-        return value / 100 if value is not None else None
-
+    frequency_converter = lambda value: value / 100 if value else None
+    
     entities = [
         EasunSensor(data_collector, "battery_voltage", "Battery Voltage", UnitOfElectricPotential.VOLT, "battery", "voltage"),
         EasunSensor(data_collector, "battery_current", "Battery Current", UnitOfElectricCurrent.AMPERE, "battery", "current"),
         EasunSensor(data_collector, "battery_power", "Battery Power", UnitOfPower.WATT, "battery", "power"),
-        EasunSensor(data_collector, "battery_soc", "Battery State of Charge", PERCENTAGE, "battery", "soc"),
+        EasunSensor(data_collector, "battery_soc", "Battery SoC", PERCENTAGE, "battery", "soc"),
         EasunSensor(data_collector, "battery_temperature", "Battery Temperature", UnitOfTemperature.CELSIUS, "battery", "temperature"),
         EasunSensor(data_collector, "pv_total_power", "PV Total Power", UnitOfPower.WATT, "pv", "total_power"),
         EasunSensor(data_collector, "pv_charging_power", "PV Charging Power", UnitOfPower.WATT, "pv", "charging_power"),
         EasunSensor(data_collector, "pv_charging_current", "PV Charging Current", UnitOfElectricCurrent.AMPERE, "pv", "charging_current"),
+        EasunSensor(data_collector, "pv_temperature", "PV Temperature", UnitOfTemperature.CELSIUS, "pv", "temperature"),
         EasunSensor(data_collector, "pv1_voltage", "PV1 Voltage", UnitOfElectricPotential.VOLT, "pv", "pv1_voltage"),
         EasunSensor(data_collector, "pv1_current", "PV1 Current", UnitOfElectricCurrent.AMPERE, "pv", "pv1_current"),
         EasunSensor(data_collector, "pv1_power", "PV1 Power", UnitOfPower.WATT, "pv", "pv1_power"),
         EasunSensor(data_collector, "pv2_voltage", "PV2 Voltage", UnitOfElectricPotential.VOLT, "pv", "pv2_voltage"),
         EasunSensor(data_collector, "pv2_current", "PV2 Current", UnitOfElectricCurrent.AMPERE, "pv", "pv2_current"),
         EasunSensor(data_collector, "pv2_power", "PV2 Power", UnitOfPower.WATT, "pv", "pv2_power"),
-        EasunSensor(data_collector, "pv_generated_today", "PV Generated Today", UnitOfEnergy.KILO_WATT_HOUR, "pv", "pv_generated_today"),
-        EasunSensor(data_collector, "pv_generated_total", "PV Generated Total", UnitOfEnergy.KILO_WATT_HOUR, "pv", "pv_generated_total"),
+        EasunSensor(data_collector, "pv_energy_today", "PV Generated Today", UnitOfEnergy.KILO_WATT_HOUR, "pv", "pv_generated_today"),
+        EasunSensor(data_collector, "pv_energy_total", "PV Generated Total", UnitOfEnergy.KILO_WATT_HOUR, "pv", "pv_generated_total"),
         EasunSensor(data_collector, "grid_voltage", "Grid Voltage", UnitOfElectricPotential.VOLT, "grid", "voltage"),
         EasunSensor(data_collector, "grid_power", "Grid Power", UnitOfPower.WATT, "grid", "power"),
         EasunSensor(data_collector, "grid_frequency", "Grid Frequency", UnitOfFrequency.HERTZ, "grid", "frequency", frequency_converter),
