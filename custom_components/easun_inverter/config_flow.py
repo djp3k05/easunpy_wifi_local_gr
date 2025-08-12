@@ -15,6 +15,7 @@ from easunpy.utils import get_local_ip
 from easunpy.models import MODEL_CONFIGS
 
 DEFAULT_SCAN_INTERVAL = 30  # Default to 30 seconds
+DEFAULT_PORT = 8899  # Default port; for VOLTRONIC_ASCII, user can override to 502 in options if needed
 _LOGGER = logging.getLogger(__name__)
 
 class EasunInverterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -38,8 +39,9 @@ class EasunInverterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             local_ip = user_input.get("local_ip")
             scan_interval = user_input.get("scan_interval", DEFAULT_SCAN_INTERVAL)
             model = user_input.get("model")  # Get model from input
+            port = user_input.get("port", DEFAULT_PORT)  # New: configurable port
             
-            _LOGGER.debug(f"Processing user input with model: {model}")
+            _LOGGER.debug(f"Processing user input with model: {model}, port: {port}")
             
             if not inverter_ip or not local_ip:
                 errors["base"] = "missing_ip"
@@ -49,6 +51,7 @@ class EasunInverterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     "local_ip": local_ip,
                     "scan_interval": scan_interval,
                     "model": model,
+                    "port": port,  # Add port to data
                 }
                 _LOGGER.debug(f"Creating entry with data: {entry_data}")
                 return self.async_create_entry(
@@ -74,6 +77,10 @@ class EasunInverterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     vol.Range(min=1, max=3600)
                 ),
                 vol.Required("model", default="ISOLAR_SMG_II_11K"): vol.In(list(MODEL_CONFIGS.keys())),
+                vol.Optional("port", default=DEFAULT_PORT): vol.All(
+                    vol.Coerce(int),
+                    vol.Range(min=1, max=65535)
+                ),
             }),
             errors=errors
         )
@@ -91,10 +98,10 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             _LOGGER.debug(f"Updating config entry with new input: {user_input}")
             
             # Get the entry data
-            entry_data = self.hass.data[DOMAIN].get(self.config_entry.entry_id, {})
-            coordinator = entry_data.get("coordinator")
+            entry_data = self.hass.data[DOMAIN].get(self.config_entry.entry_id)
             
             # Check if coordinator exists
+            coordinator = entry_data.get("coordinator") if entry_data else None
             if coordinator:
                 # Check if model has changed
                 if user_input["model"] != self.config_entry.data.get("model"):
@@ -127,6 +134,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                     "inverter_ip": user_input["inverter_ip"],
                     "local_ip": user_input["local_ip"],
                     "model": user_input["model"],
+                    "port": user_input["port"],  # Update port
                 },
                 options={
                     "scan_interval": user_input["scan_interval"],
@@ -134,10 +142,11 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             )
             _LOGGER.debug(f"Updated config entry data: {self.config_entry.data}")
             
-            # Only reload if IP or model changed (scan interval handled separately)
+            # Only reload if IP, model, or port changed (scan interval handled separately)
             if (user_input["inverter_ip"] != self.config_entry.data.get("inverter_ip") or
-                user_input["local_ip"] != self.config_entry.data.get("local_ip")):
-                _LOGGER.debug("IP address changed, reloading integration")
+                user_input["local_ip"] != self.config_entry.data.get("local_ip") or
+                user_input["port"] != self.config_entry.data.get("port")):
+                _LOGGER.debug("IP, model, or port changed, reloading integration")
                 self.hass.async_create_task(
                     self.hass.config_entries.async_reload(self.config_entry.entry_id)
                 )
@@ -160,6 +169,13 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                     default=self.config_entry.data.get("model", "ISOLAR_SMG_II_11K")
                 ): vol.In(list(MODEL_CONFIGS.keys())),
                 vol.Optional(
+                    "port",
+                    default=self.config_entry.data.get("port", DEFAULT_PORT)
+                ): vol.All(
+                    vol.Coerce(int),
+                    vol.Range(min=1, max=65535)
+                ),
+                vol.Optional(
                     "scan_interval",
                     default=self.config_entry.options.get(
                         "scan_interval", 
@@ -170,4 +186,4 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                     vol.Range(min=1, max=3600)
                 ),
             })
-        ) 
+        )
