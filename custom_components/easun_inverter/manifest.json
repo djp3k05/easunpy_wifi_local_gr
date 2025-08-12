@@ -1,6 +1,6 @@
 {
-  "domain": "easun_inverter",
-  "name": "Easun ISolar Inverter MCR",
+  "domain": "easun_inverter_gr",
+  "name": "Easun ISolar Inverter GR",
   "codeowners": ["@vgsolar2"],
   "config_flow": true,
   "dependencies": [],
@@ -9,7 +9,7 @@
   "issue_tracker": "https://github.com/djp3k05/Easun-Local-Wifi/issues",
   "requirements": [
     "dataclasses>=0.6",
-    "git+https://github.com/djp3k05/Easun-Local-Wifi.git@main#egg=easunpy",
+    "git+https://github.com/djp3k05/easunpy_wifi_local_gr.git@main#egg=easunpy",
     "aiofiles>=23.2.1"
   ],
   "version": "2.0.1"
