@@ -1,106 +1,189 @@
-# File: custom_components/easun_inverter/config_flow.py
-
 """Config flow for Easun Inverter integration."""
 from __future__ import annotations
 
 import voluptuous as vol
-import logging
-
 from homeassistant import config_entries
-from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.core import callback
+import logging
+from homeassistant.helpers.event import async_track_time_interval
+from datetime import timedelta
 
+from . import DOMAIN
 from easunpy.discover import discover_device
 from easunpy.utils import get_local_ip
 from easunpy.models import MODEL_CONFIGS
 
-from . import DOMAIN
-
+DEFAULT_SCAN_INTERVAL = 30  # Default to 30 seconds
+DEFAULT_PORT = 8899  # Default port; for VOLTRONIC_ASCII, user can override to 502 in options if needed
 _LOGGER = logging.getLogger(__name__)
-
-DEFAULT_SCAN_INTERVAL = 30
-DEFAULT_PORT = 502
-
-MODEL_KEYS = list(MODEL_CONFIGS.keys())
-
-STEP_USER_DATA_SCHEMA = vol.Schema(
-    {
-        vol.Required("inverter_ip", default=discover_device() or ""): str,
-        vol.Required("local_ip", default=get_local_ip() or ""): str,
-        vol.Required("model", default=MODEL_KEYS[0]): vol.In(MODEL_KEYS),
-        vol.Optional("port", default=DEFAULT_PORT): vol.All(
-            vol.Coerce(int), vol.Range(min=1, max=65535)
-        ),
-        vol.Optional("scan_interval", default=DEFAULT_SCAN_INTERVAL): vol.All(
-            vol.Coerce(int), vol.Range(min=1, max=3600)
-        ),
-    }
-)
-
 
 class EasunInverterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Easun Inverter."""
 
-    VERSION = 1
-    CONNECTION_CLASS = config_entries.CONN_CLASS_LOCAL_POLL
-
-    async def async_step_user(self, user_input=None) -> FlowResult:
-        """Initial step asking for inverter IP, local IP, etc."""
-        errors = {}
-
-        if user_input is not None:
-            # Validate basic connectivity if you want, or skip to create entry
-            if not user_input["inverter_ip"] or not user_input["local_ip"]:
-                errors["base"] = "missing_ip"
-            else:
-                return self.async_create_entry(
-                    title=f"Easun @ {user_input['inverter_ip']}",
-                    data=user_input,
-                )
-
-        return self.async_show_form(
-            step_id="user",
-            data_schema=STEP_USER_DATA_SCHEMA,
-            errors=errors,
-        )
+    VERSION = 4
 
     @staticmethod
     @callback
     def async_get_options_flow(config_entry):
-        """Define an options flow to allow editing after setup."""
-        return EasunInverterOptionsFlow(config_entry)
+        """Get the options flow for this handler."""
+        return OptionsFlowHandler(config_entry)
 
+    async def async_step_user(self, user_input=None):
+        """Handle a flow initialized by the user."""
+        errors = {}
 
-class EasunInverterOptionsFlow(config_entries.OptionsFlow):
-    """Handle updates to the integration options."""
+        if user_input is not None:
+            # Validate the input data
+            inverter_ip = user_input.get("inverter_ip")
+            local_ip = user_input.get("local_ip")
+            scan_interval = user_input.get("scan_interval", DEFAULT_SCAN_INTERVAL)
+            model = user_input.get("model")  # Get model from input
+            port = user_input.get("port", DEFAULT_PORT)  # New: configurable port
+            
+            _LOGGER.debug(f"Processing user input with model: {model}, port: {port}")
+            
+            if not inverter_ip or not local_ip:
+                errors["base"] = "missing_ip"
+            else:
+                entry_data = {
+                    "inverter_ip": inverter_ip,
+                    "local_ip": local_ip,
+                    "scan_interval": scan_interval,
+                    "model": model,
+                    "port": port,  # Add port to data
+                }
+                _LOGGER.debug(f"Creating entry with data: {entry_data}")
+                return self.async_create_entry(
+                    title=f"Easun Inverter ({inverter_ip})",
+                    data=entry_data,
+                )
+
+        # Attempt to discover the IPs
+        inverter_ip = discover_device()
+        local_ip = get_local_ip()
+
+        if not inverter_ip or not local_ip:
+            errors["base"] = "discovery_failed"
+
+        # Add model selection to the form
+        return self.async_show_form(
+            step_id="user",
+            data_schema=vol.Schema({
+                vol.Required("inverter_ip", default=inverter_ip): str,
+                vol.Required("local_ip", default=local_ip): str,
+                vol.Optional("scan_interval", default=DEFAULT_SCAN_INTERVAL): vol.All(
+                    vol.Coerce(int),
+                    vol.Range(min=1, max=3600)
+                ),
+                vol.Required("model", default="ISOLAR_SMG_II_11K"): vol.In(list(MODEL_CONFIGS.keys())),
+                vol.Optional("port", default=DEFAULT_PORT): vol.All(
+                    vol.Coerce(int),
+                    vol.Range(min=1, max=65535)
+                ),
+            }),
+            errors=errors
+        )
+
+class OptionsFlowHandler(config_entries.OptionsFlow):
+    """Handle options."""
 
     def __init__(self, config_entry):
         """Initialize options flow."""
         self.config_entry = config_entry
 
-    async def async_step_init(self, user_input=None) -> FlowResult:
-        """Show options form or handle its submission."""
+    async def async_step_init(self, user_input=None):
+        """Manage the options."""
         if user_input is not None:
-            # The options returned here become config_entry.options
-            return self.async_create_entry(title="", options=user_input)
+            _LOGGER.debug(f"Updating config entry with new input: {user_input}")
+            
+            # Get the entry data
+            entry_data = self.hass.data[DOMAIN].get(self.config_entry.entry_id)
+            
+            # Check if coordinator exists
+            coordinator = entry_data.get("coordinator") if entry_data else None
+            if coordinator:
+                # Check if model has changed
+                if user_input["model"] != self.config_entry.data.get("model"):
+                    await coordinator.update_model(user_input["model"])
+                
+                # Update scan interval without reloading
+                if "update_listener" in entry_data:
+                    entry_data["update_listener"]()
+                    entry_data.pop("update_listener")
+                
+                # Set up new scan interval
+                new_interval = user_input["scan_interval"]
+                
+                # Create new update listener with new interval
+                update_listener = async_track_time_interval(
+                    self.hass,
+                    entry_data.get("update_function"),
+                    timedelta(seconds=new_interval)
+                )
+                entry_data["update_listener"] = update_listener
+                entry_data["scan_interval"] = new_interval
+                
+                _LOGGER.debug(f"Updated scan interval to {new_interval} seconds")
+            
+            # Update the config entry with new data
+            self.hass.config_entries.async_update_entry(
+                self.config_entry,
+                data={
+                    **self.config_entry.data,
+                    "inverter_ip": user_input["inverter_ip"],
+                    "local_ip": user_input["local_ip"],
+                    "model": user_input["model"],
+                    "port": user_input["port"],  # Update port
+                },
+                options={
+                    "scan_interval": user_input["scan_interval"],
+                }
+            )
+            _LOGGER.debug(f"Updated config entry data: {self.config_entry.data}")
+            
+            # Only reload if IP, model, or port changed (scan interval handled separately)
+            if (user_input["inverter_ip"] != self.config_entry.data.get("inverter_ip") or
+                user_input["local_ip"] != self.config_entry.data.get("local_ip") or
+                user_input["port"] != self.config_entry.data.get("port")):
+                _LOGGER.debug("IP, model, or port changed, reloading integration")
+                self.hass.async_create_task(
+                    self.hass.config_entries.async_reload(self.config_entry.entry_id)
+                )
+            
+            return self.async_create_entry(title="", data=user_input)
 
-        # on first show, pre-fill from existing data + options
-        data = self.config_entry.data
-        opts = self.config_entry.options
-
-        schema = vol.Schema(
-            {
-                vol.Required("inverter_ip", default=data["inverter_ip"]): str,
-                vol.Required("local_ip", default=data["local_ip"]): str,
-                vol.Required("model", default=data["model"]): vol.In(MODEL_KEYS),
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema({
                 vol.Required(
-                    "port", default=data.get("port", DEFAULT_PORT)
-                ): vol.All(vol.Coerce(int), vol.Range(min=1, max=65535)),
+                    "inverter_ip",
+                    default=self.config_entry.data.get("inverter_ip")
+                ): str,
                 vol.Required(
+                    "local_ip",
+                    default=self.config_entry.data.get("local_ip")
+                ): str,
+                vol.Required(
+                    "model",
+                    default=self.config_entry.data.get("model", "ISOLAR_SMG_II_11K")
+                ): vol.In(list(MODEL_CONFIGS.keys())),
+                vol.Optional(
+                    "port",
+                    default=self.config_entry.data.get("port", DEFAULT_PORT)
+                ): vol.All(
+                    vol.Coerce(int),
+                    vol.Range(min=1, max=65535)
+                ),
+                vol.Optional(
                     "scan_interval",
-                    default=opts.get("scan_interval", data.get("scan_interval", DEFAULT_SCAN_INTERVAL)),
-                ): vol.All(vol.Coerce(int), vol.Range(min=1, max=3600)),
-            }
+                    default=self.config_entry.options.get(
+                        "scan_interval", 
+                        self.config_entry.data.get("scan_interval", DEFAULT_SCAN_INTERVAL)
+                    )
+                ): vol.All(
+                    vol.Coerce(int),
+                    vol.Range(min=1, max=3600)
+                ),
+            })
         )
-
-        return self.async_show_form(step_id="init", data_schema=schema)
