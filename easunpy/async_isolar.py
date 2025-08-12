@@ -11,7 +11,8 @@ from .models import MODEL_CONFIGS, ModelConfig
 logger = logging.getLogger(__name__)
 
 class AsyncISolar:
-    def __init__(self, inverter_ip: str, local_ip: str, model: str = "ISOLAR_SMG_II_11K", port: int = 8899):
+    def __init__(self, inverter_ip: str, local_ip: str, model: str = "ISOLAR_SMG_II_11K"):
+        port = 502 if model == "VOLTRONIC_ASCII" else 8899
         self.client = AsyncModbusClient(inverter_ip=inverter_ip, local_ip=local_ip, port=port)
         self._transaction_id = 0x0772
         
@@ -20,7 +21,6 @@ class AsyncISolar:
         
         self.model = model
         self.model_config = MODEL_CONFIGS[model]
-        self.port = port  # Store port for reference
         logger.warning(f"AsyncISolar initialized with model: {model} on port {port}")
 
     def update_model(self, model: str):
