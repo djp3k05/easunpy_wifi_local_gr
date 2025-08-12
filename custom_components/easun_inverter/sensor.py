@@ -1,4 +1,3 @@
-# sensor.py full code (no changes needed, but confirmed consistency with scaled frequencies)
 """Support for Easun Inverter sensors."""
 from datetime import datetime, timedelta
 import logging
@@ -25,6 +24,7 @@ from easunpy.async_isolar import AsyncISolar
 
 _LOGGER = logging.getLogger(__name__)
 
+DEFAULT_SCAN_INTERVAL = 30  # Add this definition here to resolve the NameError
 
 class DataCollector:
     """Centralized data collector for Easun Inverter."""
