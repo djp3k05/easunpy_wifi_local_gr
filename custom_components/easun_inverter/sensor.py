@@ -1,3 +1,4 @@
+# sensor.py full code
 """Support for Easun Inverter sensors."""
 from datetime import datetime, timedelta
 import logging
@@ -212,10 +213,9 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, add_
     inverter_ip = config_entry.data["inverter_ip"]
     local_ip = config_entry.data["local_ip"]
     model = config_entry.data["model"]
-    port = config_entry.data.get("port", 8899)  # Use configured port
     scan_interval = config_entry.data.get("scan_interval", DEFAULT_SCAN_INTERVAL)
     
-    isolar = AsyncISolar(inverter_ip, local_ip, model, port=port)
+    isolar = AsyncISolar(inverter_ip, local_ip, model)
     data_collector = DataCollector(isolar)
     
     # Store the coordinator in the domain data
