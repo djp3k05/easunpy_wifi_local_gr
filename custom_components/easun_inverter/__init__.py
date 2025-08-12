@@ -1,3 +1,4 @@
+# __init__.py full code
 """The Easun ISolar Inverter integration."""
 from __future__ import annotations
 
@@ -73,108 +74,106 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not entry_data or "coordinator" not in entry_data:
             _LOGGER.error("No coordinator found. Is the integration set up?")
             return
-            
+        
         coordinator = entry_data["coordinator"]
-        inverter = coordinator._isolar
         
-        _LOGGER.debug(f"Starting register scan from {start} for {count} registers")
+        # Create directory if needed
+        output_dir = hass.config.path("www/register_scans")
+        await makedirs(output_dir, exist_ok=True)
         
-        # Create register groups in chunks of 10
-        register_groups = []
-        for chunk_start in range(start, start + count, 10):
-            chunk_size = min(10, start + count - chunk_start)  # Handle last chunk
-            register_groups.append((chunk_start, chunk_size))
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = f"{output_dir}/register_scan_{timestamp}.json"
         
-        # Read all registers in bulk
+        # Perform the scan
         results = []
-        try:
-            responses = await inverter._read_registers_bulk(register_groups, "Int")
-            if responses:
-                for group_idx, response in enumerate(responses):
-                    if response:  # Check if we got values for this group
-                        chunk_start = register_groups[group_idx][0]
-                        for i, value in enumerate(response):
-                            if value != 0:  # Only store non-zero values
-                                reg = chunk_start + i
-                                results.append({
-                                    "register": reg,
-                                    "hex": f"0x{reg:04x}",
-                                    "value": value,
-                                    "raw": f"Register {reg}: {value}"
-                                })
-        except Exception as e:
-            _LOGGER.error(f"Error reading registers: {e}")
+        transaction_id = 0x0001  # Starting transaction ID
         
-        # Store results in hass.data for the sensor
-        scan_data = {
-            "timestamp": datetime.now().isoformat(),
-            "results": results,
-            "start_register": start,
-            "count": count
-        }
-        hass.data[DOMAIN]["last_scan"] = scan_data
-        
-        # Save to www folder
-        www_dir = hass.config.path("www")
-        try:
-            if not os.path.exists(www_dir):
-                await makedirs(www_dir)
+        for reg in range(start, start + count):
+            try:
+                request = create_request(transaction_id, 0x0001, 0xFF, 0x03, reg, 1)
+                response = await coordinator._isolar.client.send_bulk([request])
+                
+                if response and response[0]:
+                    decoded = decode_modbus_response(response[0], 1, "Int")
+                    results.append({
+                        "register": reg,
+                        "value": decoded[0] if decoded else None,
+                        "request": request,
+                        "response": response[0]
+                    })
+                else:
+                    results.append({
+                        "register": reg,
+                        "value": None,
+                        "request": request,
+                        "response": None
+                    })
+            except Exception as e:
+                results.append({
+                    "register": reg,
+                    "value": None,
+                    "error": str(e)
+                })
             
-            filename = os.path.join(www_dir, "easun_register_scan.json")
-            async with async_open(filename, 'w') as f:
-                await f.write(json.dumps(scan_data, indent=2))
-            _LOGGER.info(f"Scan complete. Found {len(results)} registers with values")
-        except Exception as e:
-            _LOGGER.error(f"Error saving scan results: {e}")
+            transaction_id += 1
+            await asyncio.sleep(0.1)  # Small delay to avoid overwhelming the inverter
+        
+        # Save results to file
+        scan_data = {
+            "timestamp": timestamp,
+            "start_register": start,
+            "count": count,
+            "results": results
+        }
+        
+        async with async_open(output_file, "w") as f:
+            await f.write(json.dumps(scan_data, indent=2))
+        
+        hass.data[DOMAIN]["register_scan"] = scan_data
+        _LOGGER.info(f"Register scan complete. Results saved to {output_file}")
 
     async def handle_device_scan(call: ServiceCall) -> None:
         """Handle the device ID scan service."""
         start_id = call.data.get("start_id", 0)
-        end_id = call.data.get("end_id", 5)
+        end_id = call.data.get("end_id", 255)
         
+        # Get the coordinator
         entry_data = hass.data[DOMAIN].get(entry.entry_id)
         if not entry_data or "coordinator" not in entry_data:
             _LOGGER.error("No coordinator found. Is the integration set up?")
             return
-            
+        
         coordinator = entry_data["coordinator"]
-        inverter = coordinator._isolar
         
-        _LOGGER.debug(f"Starting device scan from ID {start_id} to {end_id}")
-        
+        # Perform the scan
         results = []
+        transaction_id = 0x0001
         
         for device_id in range(start_id, end_id + 1):
             try:
-                # Create request
-                request = [create_request(
-                    inverter._get_next_transaction_id(),
-                    0x0001, device_id, 0x03,
-                    0x0115,
-                    1
-                )]
+                # Create a simple read request for register 0x0000 (or any valid)
+                request = create_request(transaction_id, 0x0001, device_id, 0x03, 0x0000, 1)
                 
-                # Send request and get raw response
-                responses = await inverter.client.send_bulk(request)
-                _LOGGER.debug(f"Responses: {responses}")
-                response_hex = responses[0] if responses else None
+                response = await coordinator._isolar.client.send_bulk([request])
                 
                 result = {
                     "device_id": device_id,
                     "hex": f"0x{device_id:02x}",
                     "request": request,
-                    "response": response_hex,
+                    "response": response[0] if response else None
                 }
-        
-                ERROR_RESPONSE = "00010002ff04"  # Protocol error response
                 
-                if response_hex: 
-                    if response_hex[4:] == ERROR_RESPONSE:
-                        result["status"] = "Protocol Error"
-                        _LOGGER.debug(f"Device 0x{device_id:02x} gave protocol error: {response_hex}")
-                    else:
+                if response and response[0]:
+                    response_hex = response[0]
+                    # Check if it's a valid Modbus response (function code match, etc.)
+                    if len(response_hex) >= 18 and response_hex[12:14] == "ff" and response_hex[14:16] == "03":  # Assuming unit FF, func 03
                         result["status"] = "Valid Response"
+                        result["decoded"] = decode_modbus_response(response_hex, 1, "Int")
                         _LOGGER.debug(f"Device 0x{device_id:02x} gave valid response: {response_hex}")
+                    else:
+                        result["status"] = "Invalid Response"
+                        _LOGGER.warning(f"Device 0x{device_id:02x} gave invalid or protocol error: {response_hex}")
                 else:
                     _LOGGER.debug(f"Device 0x{device_id:02x} gave no response")
                     result["status"] = "No Response"
@@ -226,6 +225,12 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if "update_listener" in hass.data[DOMAIN][entry.entry_id]:
             _LOGGER.debug("Cancelling update listener")
             hass.data[DOMAIN][entry.entry_id]["update_listener"]()
+        
+        # Cleanup the modbus client connection
+        if "coordinator" in hass.data[DOMAIN][entry.entry_id]:
+            coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
+            await coordinator._isolar.client._cleanup_server()
+            _LOGGER.debug("Cleaned up modbus client connection")
     
     # Unload the sensor platform
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
@@ -235,4 +240,4 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.debug("Removing entry data")
         hass.data[DOMAIN].pop(entry.entry_id)
     
-    return unload_ok 
+    return unload_ok
