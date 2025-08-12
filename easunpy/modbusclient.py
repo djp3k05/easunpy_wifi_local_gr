@@ -1,9 +1,10 @@
+# modbusclient.py full code
 import socket
 import struct
 import time
 import logging  # Import logging
 
-from easunpy.crc import crc16_modbus
+from easunpy.crc import crc16_modbus, crc16_xmodem, adjust_crc_byte
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -64,61 +65,41 @@ class ModbusClient:
                         client_sock.sendall(command_bytes)
 
                         logger.debug("Waiting for response...")
-                        response = client_sock.recv(1024)
-                        
-                        if len(response) >= 6:
-                            expected_length = int.from_bytes(response[4:6], 'big') + 6
-                            
-                            while len(response) < expected_length:
-                                chunk = client_sock.recv(1024)
-                                if not chunk:
-                                    break
-                                response += chunk
-
-                        response_hex = response.hex()
-                        logger.info(f"Received response: {response_hex}")
-                        return response_hex
-
-                except socket.timeout:
-                    logger.info("Socket timeout")
-                    time.sleep(1)
-                    continue
+                        response = client_sock.recv(4096)
+                        if response:
+                            logger.debug(f"Received response: {response.hex()}")
+                            return response.hex()
+                        else:
+                            logger.warning("No response received")
                 except Exception as e:
-                    logger.error(f"Error: {str(e)}")
-                    time.sleep(1)
-                    continue
-
-        logger.info("All retry attempts failed")
+                    logger.error(f"Error during TCP communication: {e}")
+                
+            time.sleep(1)
+        
         return ""
 
-def run_single_request(inverter_ip: str, local_ip: str, request: str):
+def create_request(transaction_id: int, protocol_id: int, unit_id: int, function_code: int, start: int, count: int) -> str:
     """
-    Sends a single Modbus request to the inverter.
+    Creates a Modbus TCP request in hexadecimal format.
+    :param transaction_id: Transaction ID.
+    :param protocol_id: Protocol ID.
+    :param unit_id: Unit ID.
+    :param function_code: Function code.
+    :param start: Starting register address.
+    :param count: Number of registers to read.
+    :return: Hexadecimal string of the Modbus request.
     """
-    inverter = ModbusClient(inverter_ip=inverter_ip, local_ip=local_ip)
-    response = inverter.send(request)
-    return response
-
-# Función para crear la solicitud completa
-def create_request(transaction_id: int, protocol_id: int, unit_id: int, function_code: int,
-                   register_address: int, register_offset: int) -> str:
-    """
-    Create a Modbus command with the correct length and CRC for the RTU packet.
-    """
-    # Construir el paquete RTU
+    # Construir el paquete RTU (sin TCP header)
     rtu_packet = bytearray([
-        unit_id,
-        function_code,
-        (register_address >> 8) & 0xFF, register_address & 0xFF,
-        (register_offset >> 8) & 0xFF, register_offset & 0xFF
+        unit_id, function_code,
+        (start >> 8) & 0xFF, start & 0xFF,
+        (count >> 8) & 0xFF, count & 0xFF
     ])
-
-    # Calcular el CRC para el paquete RTU
+    
+    # Calcular CRC sobre el paquete RTU
     crc = crc16_modbus(rtu_packet)
     crc_low = crc & 0xFF
     crc_high = (crc >> 8) & 0xFF
-
-    # Agregar CRC al paquete RTU
     rtu_packet.extend([crc_low, crc_high])
     
     # Campo adicional `FF04`
@@ -192,3 +173,34 @@ def get_registers_from_request(request: str) -> list:
         registers.append(register_address + i)
         
     return registers
+
+def create_ascii_request(transaction_id: int, protocol_id: int, command: str) -> str:
+    command_bytes = command.encode('ascii')
+    crc = crc16_xmodem(command_bytes)
+    crc_high = adjust_crc_byte((crc >> 8) & 0xFF)
+    crc_low = adjust_crc_byte(crc & 0xFF)
+    data = command_bytes + bytes([crc_high, crc_low, 0x0D])
+    length = len(data) + 2  # + FF 04
+    tcp_header = bytes([
+        (transaction_id >> 8) & 0xFF, transaction_id & 0xFF,
+        (protocol_id >> 8) & 0xFF, protocol_id & 0xFF,
+        (length >> 8) & 0xFF, length & 0xFF
+    ])
+    rtu_prefix = bytes([0xFF, 0x04])
+    full_command = tcp_header + rtu_prefix + data
+    return full_command.hex()
+
+def decode_ascii_response(response_hex: str) -> str:
+    if not response_hex:
+        return ""
+    response = bytes.fromhex(response_hex)
+    if len(response) < 6:
+        return ""
+    length = (response[4] << 8) | response[5]
+    if len(response) < 6 + length:
+        return ""
+    payload = response[6:6+length]
+    if len(payload) < 3 or payload[0] != 0xFF or payload[1] != 0x04:
+        return ""
+    data = payload[2:-3]  # remove FF04, CRC (2), \r (1)
+    return data.decode('ascii', errors='ignore')
