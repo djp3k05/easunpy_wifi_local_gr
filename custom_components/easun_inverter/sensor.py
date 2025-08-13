@@ -1,32 +1,36 @@
-# sensor.py full code
+# sensor.py
 """Support for Easun Inverter sensors."""
-from datetime import datetime, timedelta
-import logging
+from __future__ import annotations
+
 import asyncio
+import contextlib
+import logging
+from datetime import datetime, timedelta
 
 from homeassistant.components.sensor import SensorEntity
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     UnitOfPower,
     UnitOfElectricCurrent,
     UnitOfElectricPotential,
     UnitOfTemperature,
     UnitOfFrequency,
-    UnitOfApparentPower,
+    UnitOfAppparentPower as UnitOfApparentPower,
     UnitOfEnergy,
     PERCENTAGE,
 )
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers.event import async_track_time_interval
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 
-from . import DOMAIN  # Import DOMAIN from __init__.py
+from . import DOMAIN
 from easunpy.async_isolar import AsyncISolar
 
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_SCAN_INTERVAL = 30  # seconds
+
 
 class DataCollector:
     """Centralized data collector for Easun Inverter."""
@@ -40,7 +44,7 @@ class DataCollector:
         self._last_update_start: datetime | None = None
         self._last_successful_update: datetime | None = None
         self._update_timeout = 30
-        self._sensors: list = []
+        self._sensors: list[SensorEntity] = []
         _LOGGER.info(f"DataCollector initialized with model: {self._isolar.model}")
 
     def register_sensor(self, sensor: SensorEntity) -> None:
@@ -52,14 +56,17 @@ class DataCollector:
         """Check if the update process is stuck."""
         if self._last_update_start is None:
             return False
-        time_since_update = (datetime.now() - self._last_update_start).total_seconds()
-        return time_since_update > self._update_timeout
+        elapsed = (datetime.now() - self._last_update_start).total_seconds()
+        return elapsed > self._update_timeout
 
     async def update_data(self) -> None:
         """Fetch all data from the inverter asynchronously using bulk request."""
-        if not self._lock.acquire_nowait():
+        if self._lock.locked():
             _LOGGER.warning("Could not acquire lock for update")
             return
+
+        # Acquire the lock before starting the update
+        await self._lock.acquire()
         try:
             update_task = asyncio.create_task(self._do_update())
             try:
@@ -112,10 +119,9 @@ class EasunSensor(SensorEntity):
         key: str,
         converter=None,
     ):
-        """Initialize the sensor."""
         self._collector = data_collector
         self._unique_id = unique_id
-        self._name = name
+        self._attr_name = name
         self._unit = unit
         self._section = section
         self._key = key
@@ -126,10 +132,6 @@ class EasunSensor(SensorEntity):
     @property
     def unique_id(self) -> str:
         return f"easun_{self._unique_id}"
-
-    @property
-    def name(self) -> str:
-        return self._name
 
     @property
     def state(self):
@@ -150,7 +152,6 @@ class EasunSensor(SensorEntity):
         )
 
     def update_from_collector(self) -> None:
-        """Update the sensor state from the data collector."""
         value = self._collector.get_data(self._section, self._key)
         if self._converter and value is not None:
             value = self._converter(value)
@@ -179,10 +180,8 @@ class RegisterScanSensor(SensorEntity):
         )
 
     def update(self):
-        if DOMAIN in self._hass.data and "register_scan" in self._hass.data[DOMAIN]:
-            self._state = self._hass.data[DOMAIN]["register_scan"].get("timestamp", "No scan")
-        else:
-            self._state = "No scan"
+        scan = self._hass.data.get(DOMAIN, {}).get("register_scan", {})
+        self._state = scan.get("timestamp", "No scan")
 
 
 class DeviceScanSensor(SensorEntity):
@@ -200,9 +199,7 @@ class DeviceScanSensor(SensorEntity):
 
     @property
     def extra_state_attributes(self):
-        if DOMAIN in self._hass.data and "device_scan" in self._hass.data[DOMAIN]:
-            return self._hass.data[DOMAIN]["device_scan"]
-        return None
+        return self._hass.data.get(DOMAIN, {}).get("device_scan")
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -213,10 +210,8 @@ class DeviceScanSensor(SensorEntity):
         )
 
     def update(self):
-        if DOMAIN in self._hass.data and "device_scan" in self._hass.data[DOMAIN]:
-            self._state = self._hass.data[DOMAIN]["device_scan"].get("timestamp", "No scan")
-        else:
-            self._state = "No scan"
+        scan = self._hass.data.get(DOMAIN, {}).get("device_scan", {})
+        self._state = scan.get("timestamp", "No scan")
 
 
 async def async_setup_entry(
@@ -243,7 +238,7 @@ async def async_setup_entry(
     hass.data[DOMAIN][entry_id] = {"coordinator": data_collector}
 
     # Build sensor entities
-    frequency_converter = lambda value: value / 100 if value else None
+    frequency_converter = lambda v: v / 100 if v is not None else None
     entities: list[SensorEntity] = [
         EasunSensor(data_collector, "battery_voltage", "Battery Voltage", UnitOfElectricPotential.VOLT, "battery", "voltage"),
         EasunSensor(data_collector, "battery_current", "Battery Current", UnitOfElectricCurrent.AMPERE, "battery", "current"),
@@ -288,7 +283,7 @@ async def async_setup_entry(
                 _LOGGER.warning("Previous update appears stuck, forcing new update")
                 is_updating = False
             else:
-                _LOGGER.debug("Update already in progress, skipping this cycle")
+                _LOGGER.debug("Update in progress, skipping this cycle")
                 return
 
         _LOGGER.debug("Starting data collector update")
@@ -309,7 +304,6 @@ async def async_setup_entry(
             data_collector._last_update_start = None
             _LOGGER.debug("Data collector update finished")
 
-    # Store update function and listener for cleanup
     hass.data[DOMAIN][entry_id]["update_function"] = update_data_collector
     update_listener = async_track_time_interval(
         hass, update_data_collector, timedelta(seconds=scan_interval)
