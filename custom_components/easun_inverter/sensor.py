@@ -1,4 +1,3 @@
-# sensor.py
 """Support for Easun Inverter sensors."""
 from __future__ import annotations
 
@@ -60,7 +59,7 @@ class DataCollector:
         return elapsed > self._update_timeout
 
     async def update_data(self) -> None:
-        """Fetch all data from the inverter."""
+        """Fetch all data from the inverter asynchronously using bulk request."""
         if self._lock.locked():
             _LOGGER.warning("Previous update still in progress, skipping")
             return
@@ -242,7 +241,8 @@ async def async_setup_entry(
         EasunSensor(data_collector, "battery_current", "Battery Current", UnitOfElectricCurrent.AMPERE, "battery", "current"),
         EasunSensor(data_collector, "battery_power", "Battery Power", UnitOfPower.WATT, "battery", "power"),
         EasunSensor(data_collector, "battery_soc", "Battery SoC", PERCENTAGE, "battery", "soc"),
-        EasunSensor(data_collector, "battery_temperature", "Battery Temperature", UnitOfTemperature.CELSIUS, "battery", "temperature"),
+        # *** Renamed here ***
+        EasunSensor(data_collector, "battery_temperature", "Inverter Temperature", UnitOfTemperature.CELSIUS, "battery", "temperature"),  # was "Battery Temperature" :contentReference[oaicite:0]{index=0}
         EasunSensor(data_collector, "pv_total_power", "PV Total Power", UnitOfPower.WATT, "pv", "total_power"),
         EasunSensor(data_collector, "pv_charging_power", "PV Charging Power", UnitOfPower.WATT, "pv", "charging_power"),
         EasunSensor(data_collector, "pv_charging_current", "PV Charging Current", UnitOfElectricCurrent.AMPERE, "pv", "charging_current"),
@@ -271,7 +271,7 @@ async def async_setup_entry(
     ]
     add_entities(entities, False)
 
-    # Schedule periodic updates and push updates into Home Assistant
+    # Schedule periodic updates and force immediate HA state write
     is_updating = False
 
     async def update_data_collector(now):
@@ -288,7 +288,7 @@ async def async_setup_entry(
 
         try:
             await data_collector.update_data()
-            # After data is refreshed, write each sensor's new state
+            # write new state back into HA on your interval
             for sensor in entities:
                 sensor.async_write_ha_state()
         except Exception as err:
