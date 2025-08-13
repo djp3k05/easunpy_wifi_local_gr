@@ -7,41 +7,26 @@ from .isolar import BatteryData, PVData, GridData, OutputData, SystemStatus, Ope
 import datetime
 from .models import MODEL_CONFIGS, ModelConfig
 
-# Set up logging
-logger = logging.getLogger(__name__)
+_LOGGER = logging.getLogger(__name__)
 
 class AsyncISolar:
+    """Asynchronous interface to ISolar inverters (Modbus TCP or ASCII)."""
+
     def __init__(self, inverter_ip: str, local_ip: str, model: str = "ISOLAR_SMG_II_11K"):
         port = 502 if model == "VOLTRONIC_ASCII" else 8899
         self.client = AsyncModbusClient(inverter_ip=inverter_ip, local_ip=local_ip, port=port)
         self._transaction_id = 0x0772
-        
+
         if model not in MODEL_CONFIGS:
-            raise ValueError(
-                f"Unknown inverter model: {model}. "
-                f"Available models: {list(MODEL_CONFIGS.keys())}"
-            )
-        
+            raise ValueError(f"Unknown inverter model: {model}. Available models: {list(MODEL_CONFIGS.keys())}")
         self.model = model
         self.model_config: ModelConfig = MODEL_CONFIGS[model]
-        logger.warning(f"AsyncISolar initialized with model: {model} on port {port}")
-
-    def update_model(self, model: str):
-        """Update the model configuration."""
-        if model not in MODEL_CONFIGS:
-            raise ValueError(
-                f"Unknown inverter model: {model}. "
-                f"Available models: {list(MODEL_CONFIGS.keys())}"
-            )
-        logger.warning(f"Updating AsyncISolar to model: {model}")
-        self.model = model
-        self.model_config = MODEL_CONFIGS[model]
+        _LOGGER.info(f"AsyncISolar initialized with model: {model} on port {port}")
 
     def _get_next_transaction_id(self) -> int:
-        """Get next transaction ID and increment counter."""
-        current_id = self._transaction_id
-        self._transaction_id = (self._transaction_id + 1) & 0xFFFF  # Wrap at 0xFFFF
-        return current_id
+        tid = self._transaction_id
+        self._transaction_id = (tid + 1) & 0xFFFF
+        return tid
 
     async def _read_registers_bulk(
         self,
@@ -51,30 +36,26 @@ class AsyncISolar:
         """Read multiple groups of registers in a single connection."""
         try:
             requests = [
-                create_request(
-                    self._get_next_transaction_id(),
-                    0x0001, 0x00, 0x03,
-                    start, count
-                )
+                create_request(self._get_next_transaction_id(), 0x0001, 0x00, 0x03, start, count)
                 for start, count in register_groups
             ]
-            logger.debug(f"Sending bulk request for register groups: {register_groups}")
+            _LOGGER.debug(f"Sending bulk request for register groups: {register_groups}")
             responses = await self.client.send_bulk(requests)
-            
+
             decoded_groups: list[Optional[list[int]]] = [None] * len(register_groups)
             for i, (response, (_, count)) in enumerate(zip(responses, register_groups)):
                 try:
                     if response:
-                        decoded = decode_modbus_response(response, count, data_format)
-                        logger.debug(f"Decoded values for group {i}: {decoded}")
-                        decoded_groups[i] = decoded
+                        out = decode_modbus_response(response, count, data_format)
+                        _LOGGER.debug(f"Decoded values for group {i}: {out}")
+                        decoded_groups[i] = out
                     else:
-                        logger.warning(f"No response for register group {register_groups[i]}")
+                        _LOGGER.warning(f"No response for register group {register_groups[i]}")
                 except Exception as e:
-                    logger.warning(f"Failed to decode register group {register_groups[i]}: {e}")
+                    _LOGGER.warning(f"Failed to decode group {register_groups[i]}: {e}")
             return decoded_groups
         except Exception as e:
-            logger.error(f"Error reading registers bulk: {e}")
+            _LOGGER.error(f"Error reading registers bulk: {e}")
             return [None] * len(register_groups)
 
     async def _get_all_data_ascii(
@@ -89,118 +70,162 @@ class AsyncISolar:
         """Fetch and parse QPIGS/QPIGS2/QMOD ASCII data."""
         # Send ASCII commands
         commands = ["QPIGS", "QPIGS2", "QMOD"]
-        requests = [
-            create_ascii_request(self._get_next_transaction_id(), 0x0001, cmd)
-            for cmd in commands
-        ]
+        requests = [create_ascii_request(self._get_next_transaction_id(), 0x0001, cmd) for cmd in commands]
         responses = await self.client.send_bulk(requests)
         if not responses or len(responses) < 3:
-            raise ValueError("Failed to get responses from inverter")
-        qpigs_raw = decode_ascii_response(responses[0])
-        qpigs2_raw = decode_ascii_response(responses[1])
-        qmod_raw = decode_ascii_response(responses[2])
-        if not qpigs_raw or not qmod_raw:
-            raise ValueError("Invalid responses from inverter")
+            raise ValueError("Failed to get ASCII responses")
+        raw1 = decode_ascii_response(responses[0])
+        raw2 = decode_ascii_response(responses[1])
+        raw3 = decode_ascii_response(responses[2])
+        if not raw1 or not raw3:
+            raise ValueError("Invalid ASCII responses")
 
-        # Clean leading '('
-        qpigs_raw = qpigs_raw.lstrip('(')
-        qpigs2_raw = qpigs2_raw.lstrip('(') if qpigs2_raw else ""
-        qmod = qmod_raw.lstrip('(')
+        qpigs = raw1.lstrip('(').split()
+        qpigs2 = raw2.lstrip('(').split() if raw2 else []
+        qmod = raw3.lstrip('(')
 
-        qpigs_parts = qpigs_raw.split(' ')
-        qpigs2_parts = qpigs2_raw.split(' ') if qpigs2_raw else []
+        if len(qpigs) < 21:
+            raise ValueError("Unexpected QPIGS format")
 
-        if len(qpigs_parts) < 21:
-            raise ValueError("Invalid QPIGS response")
-
-        values: Dict[str, Any] = {}
+        vals: Dict[str, Any] = {}
 
         # 1) Grid & Output
-        values["grid_voltage"]         = float(qpigs_parts[0])
-        values["grid_frequency"]       = float(qpigs_parts[1]) * 100
-        values["output_voltage"]       = float(qpigs_parts[2])
-        values["output_current"]       = float(qpigs_parts[3])
-        values["output_frequency"]     = float(qpigs_parts[4]) * 100
-        values["output_power"]         = int(qpigs_parts[5])
-        values["output_apparent_power"]= int(qpigs_parts[6])
-        values["output_load_percentage"]= int(qpigs_parts[7])
+        vals["grid_voltage"]          = float(qpigs[0])
+        vals["grid_frequency"]        = float(qpigs[1]) * 100
+        vals["output_voltage"]        = float(qpigs[2])
+        vals["output_frequency"]      = float(qpigs[3]) * 100
+        vals["output_apparent_power"] = int(qpigs[4])
+        vals["output_power"]          = int(qpigs[5])
+        vals["output_load_percentage"]= int(qpigs[6])
 
         # 2) Battery
-        values["battery_voltage"]      = float(qpigs_parts[8])
-        battery_chg                    = float(qpigs_parts[9])
-        battery_dis                    = float(qpigs_parts[15])
-        values["battery_current"]      = battery_chg - battery_dis
-        values["battery_power"]        = int(values["battery_voltage"] * values["battery_current"])
-        values["battery_soc"]          = int(qpigs_parts[10])
-        # Inverter heat‐sink temp
-        values["battery_temperature"]  = int(qpigs_parts[11])
-        values["pv_temperature"]       = float(qpigs_parts[14])
+        vals["battery_voltage"]       = float(qpigs[8])
+        battery_chg                   = float(qpigs[9])
+        battery_dis                   = float(qpigs[15])
+        vals["battery_current"]       = battery_chg - battery_dis
+        vals["battery_power"]         = int(vals["battery_voltage"] * vals["battery_current"])
+        vals["battery_soc"]           = int(qpigs[10])
+        # rename: this is inverter heat‐sink temp
+        vals["battery_temperature"]   = int(qpigs[11])
+        vals["pv_temperature"]        = vals["battery_temperature"]
 
         # 3) PV1
-        pv1_curr_raw                   = float(qpigs_parts[12])
-        pv1_volt                       = float(qpigs_parts[13])
-        raw_pv1                        = qpigs_parts[19]
+        pv1_curr                     = float(qpigs[12])
+        pv1_volt                     = float(qpigs[13])
+        raw_pv1                      = qpigs[19]
         if "." in raw_pv1:
             pv1_power = int(float(raw_pv1) * 1000)
         else:
             pv1_power = int(raw_pv1)
-
-        values["pv1_voltage"]          = pv1_volt
-        values["pv1_current"]          = pv1_curr_raw
-        values["pv1_power"]            = pv1_power
-        values["pv_total_power"]       = pv1_power
-        values["pv_charging_power"]    = pv1_power
-        values["pv_charging_current"]  = pv1_curr_raw
+        vals["pv_charging_current"]   = pv1_curr
+        vals["pv1_voltage"]           = pv1_volt
+        vals["pv1_current"]           = pv1_curr
+        vals["pv1_power"]             = pv1_power
+        vals["pv_total_power"]        = pv1_power
+        vals["pv_charging_power"]     = pv1_power
 
         # 4) PV2 (if present)
-        if len(qpigs2_parts) >= 3:
-            pv2_curr_raw              = float(qpigs2_parts[0])
-            pv2_volt                  = float(qpigs2_parts[1])
-            raw_pv2                   = qpigs2_parts[2]
+        if len(qpigs2) >= 3:
+            pv2_curr                 = float(qpigs2[0])
+            pv2_volt                 = float(qpigs2[1])
+            raw_pv2                  = qpigs2[2]
             if "." in raw_pv2:
                 pv2_power = int(float(raw_pv2) * 1000)
             else:
                 pv2_power = int(raw_pv2)
-            values["pv2_voltage"]       = pv2_volt
-            values["pv2_current"]       = pv2_curr_raw
-            values["pv2_power"]         = pv2_power
-            values["pv_total_power"]   += pv2_power
-            values["pv_charging_power"]+= pv2_power
-            values["pv_charging_current"] += pv2_curr_raw
+            vals["pv2_current"]       = pv2_curr
+            vals["pv2_voltage"]       = pv2_volt
+            vals["pv2_power"]         = pv2_power
+            vals["pv_total_power"]   += pv2_power
+            vals["pv_charging_power"]+= pv2_power
+            vals["pv_charging_current"] += pv2_curr
         else:
-            values["pv2_voltage"]       = 0.0
-            values["pv2_current"]       = 0.0
-            values["pv2_power"]         = 0
+            vals["pv2_current"]       = 0.0
+            vals["pv2_voltage"]       = 0.0
+            vals["pv2_power"]         = 0
 
-        # 5) Net Grid Power (after PV1+PV2)
-        values["grid_power"]          = (
-            values["output_power"]
-            + values["battery_power"]
-            - values["pv_charging_power"]
-        )
+        # 5) Grid import only
+        net = vals["output_power"] + vals["battery_power"] - vals["pv_charging_power"]
+        vals["grid_power"]           = max(0, net)
 
         # No energy stats in ASCII
-        values["pv_energy_today"]     = None
-        values["pv_energy_total"]     = None
+        vals["pv_energy_today"]      = None
+        vals["pv_energy_total"]      = None
 
-        # 6) System Status (QMOD)
+        # 6) System status
         if qmod in ['L', 'C']:
-            values["operation_mode"] = 2
-            values["mode_name"]      = "Line Mode" if qmod == 'L' else "Charging Mode"
+            vals["operation_mode"] = 2
+            vals["mode_name"]      = "Line Mode" if qmod == 'L' else "Charging Mode"
         elif qmod == 'B':
-            values["operation_mode"] = 3
-            values["mode_name"]      = "Battery Mode"
+            vals["operation_mode"] = 3
+            vals["mode_name"]      = "Battery Mode"
         else:
-            values["operation_mode"] = 0
-            values["mode_name"]      = f"UNKNOWN ({qmod})"
-        values["inverter_time"]       = None
+            vals["operation_mode"] = 0
+            vals["mode_name"]      = f"UNKNOWN ({qmod})"
+        vals["inverter_time"]        = None
 
         # Build dataclasses
-        battery = self._create_battery_data(values)
-        pv      = self._create_pv_data(values)
-        grid    = self._create_grid_data(values)
-        output  = self._create_output_data(values)
-        system  = self._create_system_status(values)
+        battery = self._create_battery_data(vals)
+        pv      = self._create_pv_data(vals)
+        grid    = self._create_grid_data(vals)
+        output  = self._create_output_data(vals)
+        system  = self._create_system_status(vals)
+        return battery, pv, grid, output, system
+
+    async def get_all_data(
+        self,
+    ) -> Tuple[
+        Optional[BatteryData],
+        Optional[PVData],
+        Optional[GridData],
+        Optional[OutputData],
+        Optional[SystemStatus],
+    ]:
+        """Get all inverter data, routing to ASCII or Modbus branch."""
+        if self.model == "VOLTRONIC_ASCII":
+            return await self._get_all_data_ascii()
+
+        # Modbus branch unchanged…
+        register_groups = []
+        current_group = None
+        registers = sorted(
+            set(
+                self.model_config.get_address(name)
+                for name in self.model_config.register_map
+                if self.model_config.get_address(name)
+            )
+        )
+        for reg in registers:
+            if current_group is None:
+                current_group = (reg, 1)
+            elif reg == current_group[0] + current_group[1]:
+                current_group = (current_group[0], current_group[1] + 1)
+            else:
+                register_groups.append(current_group)
+                current_group = (reg, 1)
+        if current_group:
+            register_groups.append(current_group)
+        decoded_groups = await self._read_registers_bulk(register_groups)
+        all_vals = []
+        for group in decoded_groups:
+            if group:
+                all_vals.extend(group)
+        reg_map = {}
+        next_reg = register_groups[0][0] if register_groups else 0
+        for v in all_vals:
+            reg_map[next_reg] = v
+            next_reg += 1
+        processed = {}
+        for name, cfg in self.model_config.register_map.items():
+            addr = cfg.address
+            if addr in reg_map:
+                raw = reg_map[addr]
+                processed[name] = cfg.processor(raw) if cfg.processor else raw * cfg.scale_factor
+        battery = self._create_battery_data(processed)
+        pv      = self._create_pv_data(processed)
+        grid    = self._create_grid_data(processed)
+        output  = self._create_output_data(processed)
+        system  = self._create_system_status(processed)
         return battery, pv, grid, output, system
 
     async def get_all_data(
