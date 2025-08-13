@@ -1,113 +1,99 @@
-# async_modbusclient.py full code
+# async_modbusclient.py
 import asyncio
 import logging
 import socket
 import time
+from typing import Set, Optional
 
-# Set up logging
 logger = logging.getLogger(__name__)
 
 class DiscoveryProtocol(asyncio.DatagramProtocol):
     """Protocol for UDP discovery of the inverter."""
-    def __init__(self, inverter_ip, message):
-        self.transport = None
+    def __init__(self, inverter_ip: str, message: bytes):
+        self.transport: Optional[asyncio.transports.DatagramTransport] = None
         self.inverter_ip = inverter_ip
         self.message = message
-        self.response_received = asyncio.get_event_loop().create_future()
+        loop = asyncio.get_event_loop()
+        self.response_received = loop.create_future()
 
     def connection_made(self, transport):
         self.transport = transport
         logger.debug(f"Sending UDP discovery message to {self.inverter_ip}:58899")
-        self.transport.sendto(self.message)
+        self.transport.sendto(self.message, (self.inverter_ip, 58899))
 
     def datagram_received(self, data, addr):
-        logger.info(f"Received response from {addr}")
-        self.response_received.set_result(True)
+        logger.info(f"Received discovery response from {addr}")
+        if not self.response_received.done():
+            self.response_received.set_result(True)
 
     def error_received(self, exc):
-        logger.error(f"Error received: {exc}")
-        self.response_received.set_result(False)
+        logger.error(f"UDP discovery error received: {exc}")
+        if not self.response_received.done():
+            self.response_received.set_result(False)
+
 
 class AsyncModbusClient:
+    """
+    Minimal server-side TCP endpoint used by Easun/Voltronic WiFi modules:
+    - We send UDP: set>server=<local_ip>:<port>;
+    - The inverter connects back to us on that TCP port and we exchange frames.
+    """
     def __init__(self, inverter_ip: str, local_ip: str, port: int = 8899):
         self.inverter_ip = inverter_ip
         self.local_ip = local_ip
         self.port = port
+
         self._lock = asyncio.Lock()
-        self._server = None
-        self._consecutive_udp_failures = 0
-        self._base_timeout = 5
-        self._active_connections = set()  # Track active connections
-        self._reader = None
-        self._writer = None
+        self._server: Optional[asyncio.AbstractServer] = None
+        self._active_connections: Set[asyncio.StreamWriter] = set()
+        self._reader: Optional[asyncio.StreamReader] = None
+        self._writer: Optional[asyncio.StreamWriter] = None
+
+        self._connection_future: Optional[asyncio.Future] = None
         self._connection_established = False
-        self._last_activity = 0
-        self._connection_timeout = 30  # Timeout in seconds before considering connection stale
-        self._connection_future = None
+        self._last_activity = 0.0
+        self._connection_timeout = 30  # idle connection considered stale
 
     async def _cleanup_server(self):
-        """Cleanup server and all active connections."""
+        """Close all sockets and reset state to allow fresh binds."""
         try:
-            # Close all active connections
-            for writer in self._active_connections.copy():
+            # close client sockets
+            for w in list(self._active_connections):
                 try:
-                    if not writer.is_closing():
-                        writer.close()
-                        await writer.wait_closed()
-                    else:
-                        logger.debug("Connection already closed")
+                    if not w.is_closing():
+                        w.close()
+                        await w.wait_closed()
                 except Exception as e:
                     logger.debug(f"Error closing connection: {e}")
                 finally:
-                    self._active_connections.remove(writer)
+                    self._active_connections.discard(w)
 
-            # Close the server
-            if self._server:
+            # close server socket
+            if self._server is not None:
                 try:
-                    if self._server.is_serving():
-                        self._server.close()
-                        await self._server.wait_closed()
-                        logger.debug("Server cleaned up successfully")
-                    else:
-                        logger.debug("Server already closed")
+                    self._server.close()
+                    await self._server.wait_closed()
+                    logger.debug("Server cleaned up successfully")
                 except Exception as e:
                     logger.debug(f"Error closing server: {e}")
-                finally:
-                    self._server = None
-            await asyncio.sleep(1)  # Give time for port to be released
-        except Exception as e:
-            logger.debug(f"Error during cleanup: {e}")
+            await asyncio.sleep(0.2)  # give OS time to release the port
         finally:
             self._server = None
-            self._active_connections.clear()
-            self._connection_established = False
             self._reader = None
             self._writer = None
+            self._connection_established = False
             if self._connection_future and not self._connection_future.done():
                 self._connection_future.set_result(False)
-
-    async def _find_available_port(self, start_port: int = 8899, max_attempts: int = 20) -> int:
-        """Find an available port starting from the given port."""
-        port = start_port
-        for _ in range(max_attempts):
-            try:
-                server = await asyncio.get_event_loop().create_server(lambda: None, self.local_ip, port)
-                await server.close()
-                return port
-            except OSError:
-                port += 1
-        raise RuntimeError(f"No available port found after {max_attempts} attempts")
+            self._connection_future = None
 
     async def _send_udp_discovery(self) -> bool:
-        """Send UDP discovery message and wait for response with timeout."""
+        """Send UDP discovery message and wait briefly for any reply."""
         message = f"set>server={self.local_ip}:{self.port};".encode()
-        
         try:
             transport, protocol = await asyncio.get_event_loop().create_datagram_endpoint(
                 lambda: DiscoveryProtocol(self.inverter_ip, message),
-                remote_addr=(self.inverter_ip, 58899)
+                remote_addr=(self.inverter_ip, 58899),
             )
-            
             try:
                 await asyncio.wait_for(protocol.response_received, timeout=2)
                 return True
@@ -121,126 +107,118 @@ class AsyncModbusClient:
             return False
 
     async def _ensure_connection(self) -> bool:
-        """Ensure TCP connection is established."""
-        if self._connection_established:
-            if time.time() - self._last_activity > self._connection_timeout:
-                logger.debug("Connection stale, cleaning up")
-                await self._cleanup_server()
-            else:
-                logger.debug("Connection already established")
-                return True
+        """
+        Make sure we have a live connection:
+        - If stale, clean up.
+        - Else start a server and wait for inverter to connect back.
+        """
+        # active and not stale?
+        if self._connection_established and (time.time() - self._last_activity) < self._connection_timeout:
+            logger.debug("Reusing existing TCP connection")
+            return True
+        if self._server is not None:
+            logger.debug("Cleaning up previous server before starting a new one")
+            await self._cleanup_server()
 
-        logger.debug("Establishing new connection")
-        
-        # Send UDP discovery
+        # tell inverter where to connect
         if not await self._send_udp_discovery():
-            self._consecutive_udp_failures += 1
-            if self._consecutive_udp_failures >= 3:
-                logger.error("Multiple UDP failures, attempting port change")
-                self.port = await self._find_available_port(self.port + 1)
-                self._consecutive_udp_failures = 0
             return False
-        
-        self._consecutive_udp_failures = 0
-        
-        # Create TCP server
+
+        # create the TCP server and wait for accept
         try:
-            self._connection_future = asyncio.Future()
+            self._connection_future = asyncio.get_event_loop().create_future()
             self._server = await asyncio.start_server(
                 self._handle_connection,
                 self.local_ip,
-                self.port
+                self.port,
+                reuse_address=True,  # allow quick rebinds if we had timeouts/cancels
+                start_serving=True,
             )
             logger.debug(f"TCP server listening on {self.local_ip}:{self.port}")
-            # Wait for connection with timeout
             try:
-                await asyncio.wait_for(self._connection_future, timeout=5)
-                return True
+                # give the inverter a bit more time to connect back
+                await asyncio.wait_for(self._connection_future, timeout=10)
+                return self._connection_established
             except asyncio.TimeoutError:
                 logger.warning("Timeout waiting for client connection")
                 await self._cleanup_server()
                 return False
-        except Exception as e:
+        except OSError as e:
             logger.error(f"Failed to start TCP server: {e}")
+            # try to cleanup and give OS a moment, then signal failure
+            await self._cleanup_server()
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error starting TCP server: {e}")
+            await self._cleanup_server()
             return False
 
-    async def _handle_connection(self, reader, writer):
-        """Handle incoming client connection."""
-        addr = writer.get_extra_info('peername')
+    async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Accept callback from asyncio.start_server()."""
+        addr = writer.get_extra_info("peername")
         logger.info(f"Client connected from {addr}")
-        
-        # If there's an existing connection, close it
+
+        # Replace any prior client
         if self._writer and not self._writer.is_closing():
-            logger.warning("Existing connection found, closing it")
-            self._writer.close()
-            await self._writer.wait_closed()
+            try:
+                self._writer.close()
+                await self._writer.wait_closed()
+            except Exception:
+                pass
 
         self._reader = reader
         self._writer = writer
+        self._active_connections.add(writer)
         self._connection_established = True
         self._last_activity = time.time()
-        self._active_connections.add(writer)
-        logger.info("Client connection established")
+
         if self._connection_future and not self._connection_future.done():
             self._connection_future.set_result(True)
 
     async def send_bulk(self, hex_commands: list[str], retry_count: int = 5) -> list[str]:
-        """Send multiple Modbus TCP commands using persistent connection."""
+        """Send multiple frames on a single connection. Returns hex responses in order."""
         async with self._lock:
-            responses = []
-            
             for attempt in range(retry_count):
+                responses: list[str] = []
+                ok = await self._ensure_connection()
+                if not ok:
+                    await asyncio.sleep(1)
+                    continue
+
                 try:
-                    if not await self._ensure_connection():
-                        if attempt == retry_count - 1:
-                            logger.error("Failed to establish connection after all attempts")
-                            return []
-                        await asyncio.sleep(1)
-                        continue
-
                     for command in hex_commands:
-                        try:
-                            if self._writer.is_closing():
-                                logger.warning("Connection closed while processing commands")
-                                self._connection_established = False
-                                break
-
-                            logger.debug(f"Sending command: {command}")
-                            command_bytes = bytes.fromhex(command)
-                            self._writer.write(command_bytes)
-                            await self._writer.drain()
-
-                            response = await asyncio.wait_for(self._reader.read(1024), timeout=5)
-                            if len(response) >= 6:
-                                expected_length = int.from_bytes(response[4:6], 'big') + 6
-                                while len(response) < expected_length:
-                                    chunk = await asyncio.wait_for(self._reader.read(1024), timeout=5)
-                                    if not chunk:
-                                        break
-                                    response += chunk
-
-                            logger.debug(f"Response: {response.hex()}")
-                            responses.append(response.hex())
-                            self._last_activity = time.time()
-                            await asyncio.sleep(0.1)
-
-                        except asyncio.TimeoutError:
-                            logger.error(f"Timeout reading response for command: {command}")
+                        if self._writer is None or self._writer.is_closing():
+                            logger.warning("Connection closed while sending commands")
                             self._connection_established = False
                             break
-                        except Exception as e:
-                            logger.error(f"Error processing command {command}: {e}")
-                            self._connection_established = False
-                            break
+
+                        logger.debug(f"Sending command: {command}")
+                        self._writer.write(bytes.fromhex(command))
+                        await self._writer.drain()
+
+                        # Read MBAP header to know length, then read rest
+                        resp = await asyncio.wait_for(self._reader.read(6), timeout=5)
+                        if len(resp) < 6:
+                            raise asyncio.TimeoutError("Short MBAP header")
+                        expected = int.from_bytes(resp[4:6], "big")
+                        body = await asyncio.wait_for(self._reader.read(expected), timeout=5)
+                        response = (resp + body).hex()
+                        logger.debug(f"Response: {response}")
+                        responses.append(response)
+                        self._last_activity = time.time()
+                        await asyncio.sleep(0.05)
 
                     if len(responses) == len(hex_commands):
                         return responses
 
+                except asyncio.TimeoutError as e:
+                    logger.error(f"Timeout reading response: {e}")
                 except Exception as e:
-                    logger.error(f"Bulk send error: {e}")
-                    self._connection_established = False
-                    await self._cleanup_server()
-                
+                    logger.error(f"Error during bulk send: {e}")
+
+                # something went wrong, reset connection and retry
+                await self._cleanup_server()
                 await asyncio.sleep(1)
 
-            return [] 
+            logger.error("Failed to establish connection after all attempts")
+            return []
