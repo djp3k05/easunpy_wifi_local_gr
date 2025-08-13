@@ -128,6 +128,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                     "inverter_ip": user_input["inverter_ip"],
                     "local_ip": user_input["local_ip"],
                     "model": user_input["model"],
+                    "scan_interval": user_input["scan_interval"],
                 },
                 options={
                     "scan_interval": user_input["scan_interval"],
@@ -137,7 +138,8 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             
             # Only reload if IP or model changed (scan interval handled separately)
             if (user_input["inverter_ip"] != self.config_entry.data.get("inverter_ip") or
-                user_input["local_ip"] != self.config_entry.data.get("local_ip")):
+                user_input["local_ip"] != self.config_entry.data.get("local_ip") or
+                user_input["model"] != self.config_entry.data.get("model")):
                 _LOGGER.debug("IP or model changed, reloading integration")
                 self.hass.async_create_task(
                     self.hass.config_entries.async_reload(self.config_entry.entry_id)
