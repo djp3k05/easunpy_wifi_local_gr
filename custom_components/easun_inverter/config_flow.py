@@ -89,62 +89,15 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
     async def async_step_init(self, user_input=None):
         """Manage the options."""
         if user_input is not None:
-            _LOGGER.debug(f"Updating config entry with new input: {user_input}")
-            
-            # Get the entry data
-            entry_data = self.hass.data[DOMAIN].get(self.config_entry.entry_id)
-            
-            # Check if coordinator exists
-            coordinator = entry_data.get("coordinator") if entry_data else None
-            if coordinator:
-                # Check if model has changed
-                if user_input["model"] != self.config_entry.data.get("model"):
-                    await coordinator.update_model(user_input["model"])
-                
-                # Update scan interval without reloading
-                if "update_listener" in entry_data:
-                    entry_data["update_listener"]()
-                    entry_data.pop("update_listener")
-                
-                # Set up new scan interval
-                new_interval = user_input["scan_interval"]
-                
-                # Create new update listener with new interval
-                update_listener = async_track_time_interval(
-                    self.hass,
-                    entry_data.get("update_function"),
-                    timedelta(seconds=new_interval)
-                )
-                entry_data["update_listener"] = update_listener
-                entry_data["scan_interval"] = new_interval
-                
-                _LOGGER.debug(f"Updated scan interval to {new_interval} seconds")
-            
-            # Update the config entry with new data
+            # Store only scan_interval in options
             self.hass.config_entries.async_update_entry(
                 self.config_entry,
-                data={
-                    **self.config_entry.data,
-                    "inverter_ip": user_input["inverter_ip"],
-                    "local_ip": user_input["local_ip"],
-                    "model": user_input["model"],
-                    "scan_interval": user_input["scan_interval"],
-                },
-                options={
-                    "scan_interval": user_input["scan_interval"],
-                }
+                options={ "scan_interval": user_input["scan_interval"] },
             )
-            _LOGGER.debug(f"Updated config entry data: {self.config_entry.data}")
-            
-            # Only reload if IP or model changed (scan interval handled separately)
-            if (user_input["inverter_ip"] != self.config_entry.data.get("inverter_ip") or
-                user_input["local_ip"] != self.config_entry.data.get("local_ip") or
-                user_input["model"] != self.config_entry.data.get("model")):
-                _LOGGER.debug("IP or model changed, reloading integration")
-                self.hass.async_create_task(
-                    self.hass.config_entries.async_reload(self.config_entry.entry_id)
-                )
-            
+            # Reload integration so async_setup_entry re-runs with new interval
+            self.hass.async_create_task(
+                self.hass.config_entries.async_reload(self.config_entry.entry_id)
+            )
             return self.async_create_entry(title="", data=user_input)
 
         return self.async_show_form(
