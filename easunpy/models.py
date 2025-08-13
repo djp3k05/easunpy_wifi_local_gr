@@ -1,89 +1,130 @@
-# models.py full code
 from dataclasses import dataclass, field
 from enum import Enum
 import datetime
 from typing import Dict, Optional, Callable, Any
 
+# -------------------------
+# Runtime data containers
+# -------------------------
+
 @dataclass
 class BatteryData:
-    # live values
-    voltage: Optional[float] = None
-    current: Optional[float] = None           # net current (+ = charging, - = discharging)
-    power: Optional[int] = None
-    soc: Optional[int] = None
-    temperature: Optional[int] = None
-    # extras from ASCII QPIGS
-    charge_current: Optional[float] = None    # Battery Charging Current (A)
-    discharge_current: Optional[float] = None # Battery Discharge Current (A)
-    voltage_scc: Optional[float] = None       # Battery Voltage from SCC (V)
+    voltage: Optional[float]
+    current: Optional[float]
+    power: Optional[int]
+    soc: Optional[int]
+    temperature: Optional[int]
+    # Extras from QPIGS
+    charge_current: Optional[float] = None
+    discharge_current: Optional[float] = None
+    voltage_scc: Optional[float] = None
+    voltage_offset_for_fans: Optional[float] = None
+    eeprom_version: Optional[str] = None
 
 @dataclass
 class PVData:
-    total_power: Optional[int] = None
-    charging_power: Optional[int] = None
-    charging_current: Optional[float] = None
-    temperature: Optional[int] = None
-    pv1_voltage: Optional[float] = None
-    pv1_current: Optional[float] = None
-    pv1_power: Optional[int] = None
-    pv2_voltage: Optional[float] = None
-    pv2_current: Optional[float] = None
-    pv2_power: Optional[int] = None
+    total_power: Optional[int]
+    charging_power: Optional[int]
+    charging_current: Optional[float]
+    temperature: Optional[int]
+    pv1_voltage: Optional[float]
+    pv1_current: Optional[float]
+    pv1_power: Optional[int]
+    pv2_voltage: Optional[float]
+    pv2_current: Optional[float]
+    pv2_power: Optional[int]
     pv_generated_today: Optional[float] = None
     pv_generated_total: Optional[float] = None
 
 @dataclass
 class GridData:
-    voltage: Optional[float] = None
-    power: Optional[int] = None
-    frequency: Optional[int] = None  # 5000 == 50.00Hz (kept for compatibility)
+    voltage: Optional[float]
+    power: Optional[int]
+    frequency: Optional[int]
 
 @dataclass
 class OutputData:
-    voltage: Optional[float] = None
-    current: Optional[float] = None
-    power: Optional[int] = None
-    apparent_power: Optional[int] = None
-    load_percentage: Optional[float] = None
-    frequency: Optional[int] = None  # 5000 == 50.00Hz
+    voltage: Optional[float]
+    current: Optional[float]
+    power: Optional[int]
+    apparent_power: Optional[int]
+    load_percentage: Optional[int]
+    frequency: Optional[int]
+
+# -------------------------
+# Operating mode
+# -------------------------
 
 class OperatingMode(Enum):
     FAULT = 0
     SUB = 2
     SBU = 3
 
+# -------------------------
+# “System / device” data
+# -------------------------
+
 @dataclass
 class SystemStatus:
     operating_mode: OperatingMode
     mode_name: Optional[str] = None
     inverter_time: Optional[datetime.datetime] = None
-    # extras (ASCII)
+
+    # Flags / warnings
+    warnings: Optional[str] = None
+    device_status_flags: Optional[str] = None
+    device_status_flags2: Optional[str] = None
+    bus_voltage: Optional[float] = None
+
+    # QPIRI “ratings & settings”
+    grid_rating_voltage: Optional[float] = None
+    grid_rating_current: Optional[float] = None
+    ac_output_rating_voltage: Optional[float] = None
+    ac_output_rating_frequency: Optional[float] = None
+    ac_output_rating_current: Optional[float] = None
+    ac_output_rating_apparent_power: Optional[int] = None
+    ac_output_rating_active_power: Optional[int] = None
+    battery_rating_voltage: Optional[float] = None
+    battery_recharge_voltage: Optional[float] = None
+    battery_undervoltage: Optional[float] = None
+    battery_bulk_voltage: Optional[float] = None
+    battery_float_voltage: Optional[float] = None
+    battery_type: Optional[str] = None
+    max_ac_charging_current: Optional[float] = None
+    max_charging_current: Optional[float] = None
+    input_voltage_range: Optional[str] = None
+    output_source_priority: Optional[str] = None
+    charger_source_priority: Optional[str] = None
+    parallel_max_num: Optional[int] = None
+    machine_type: Optional[str] = None
+    topology: Optional[str] = None
     output_mode_qpiri: Optional[str] = None
-    device_status: Optional[str] = None        # raw QPIGS device status bits
-    device_status2: Optional[str] = None       # raw QPIGS device status 2 bits
-    warnings: Optional[str] = None             # parsed QPIWS warnings string
+    battery_redischarge_voltage: Optional[float] = None
+    pv_ok_condition: Optional[str] = None
+    pv_power_balance: Optional[str] = None
+    max_charging_time_cv: Optional[int] = None
+    max_discharging_current: Optional[float] = None
+
+# -------------------------
+# Register mapping for Modbus models
+# -------------------------
 
 @dataclass
 class RegisterConfig:
-    """Configuration for a single register."""
     address: int
     scale_factor: float = 1.0
     processor: Optional[Callable[[int], Any]] = None
 
 @dataclass
 class ModelConfig:
-    """Complete configuration for an inverter model."""
     name: str
     register_map: Dict[str, RegisterConfig] = field(default_factory=dict)
-    
     def get_address(self, register_name: str) -> Optional[int]:
         config = self.register_map.get(register_name)
         return config.address if config else None
-    
     def get_scale_factor(self, register_name: str) -> float:
         config = self.register_map.get(register_name)
         return config.scale_factor if config else 1.0
-    
     def process_value(self, register_name: str, value: int) -> Any:
         config = self.register_map.get(register_name)
         if not config:
@@ -92,7 +133,6 @@ class ModelConfig:
             return config.processor(value)
         return value * config.scale_factor
 
-# Define model configurations (unchanged)
 ISOLAR_SMG_II_11K = ModelConfig(
     name="ISOLAR_SMG_II_11K",
     register_map={
@@ -167,15 +207,10 @@ ISOLAR_SMG_II_6K = ModelConfig(
         "time_register_3": RegisterConfig(699, processor=int),
         "time_register_4": RegisterConfig(700, processor=int),
         "time_register_5": RegisterConfig(701, processor=int),
-        "pv_energy_today": RegisterConfig(0),
-        "pv_energy_total": RegisterConfig(0),
     }
 )
 
-VOLTRONIC_ASCII = ModelConfig(
-    name="VOLTRONIC_ASCII",
-    register_map={}
-)
+VOLTRONIC_ASCII = ModelConfig(name="VOLTRONIC_ASCII", register_map={})
 
 MODEL_CONFIGS = {
     "ISOLAR_SMG_II_11K": ISOLAR_SMG_II_11K,
