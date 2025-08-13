@@ -1,4 +1,3 @@
-# models.py full code
 from dataclasses import dataclass, field
 from enum import Enum
 import datetime
@@ -43,6 +42,7 @@ class OutputData:
     frequency: int
 
 class OperatingMode(Enum):
+    FAULT = 0   # Added safe fallback so code can represent unknown modes
     SUB = 2
     SBU = 3
 
