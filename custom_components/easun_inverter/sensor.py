@@ -244,6 +244,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, add_
     local_ip = config_entry.data["local_ip"]
     model = config_entry.data["model"]
     scan_interval = config_entry.options.get("scan_interval", config_entry.data.get("scan_interval", DEFAULT_SCAN_INTERVAL))
+    _LOGGER.debug(f"Setting up entry with scan_interval: {scan_interval}")
     
     isolar = AsyncISolar(inverter_ip, local_ip, model)
     data_collector = DataCollector(isolar)
