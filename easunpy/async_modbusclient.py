@@ -1,3 +1,4 @@
+# async_modbusclient.py full code
 import asyncio
 import logging
 import socket
@@ -83,104 +84,84 @@ class AsyncModbusClient:
 
     async def _find_available_port(self, start_port: int = 8899, max_attempts: int = 20) -> int:
         """Find an available port starting from the given port."""
-        for port in range(start_port, start_port + max_attempts):
+        port = start_port
+        for _ in range(max_attempts):
             try:
-                # Test if port is available
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.bind((self.local_ip, port))
-                sock.close()
+                server = await asyncio.get_event_loop().create_server(lambda: None, self.local_ip, port)
+                await server.close()
                 return port
             except OSError:
-                continue
-        raise RuntimeError(f"No available ports found between {start_port} and {start_port + max_attempts}")
+                port += 1
+        raise RuntimeError(f"No available port found after {max_attempts} attempts")
 
-    async def send_udp_discovery(self) -> bool:
-        """Perform UDP discovery with adaptive timeout."""
-        timeout = min(30, self._base_timeout * (1 + self._consecutive_udp_failures))
-        loop = asyncio.get_event_loop()
+    async def _send_udp_discovery(self) -> bool:
+        """Send UDP discovery message and wait for response with timeout."""
         message = f"set>server={self.local_ip}:{self.port};".encode()
-
-        for attempt in range(3):  # Try each discovery up to 3 times
+        
+        try:
+            transport, protocol = await asyncio.get_event_loop().create_datagram_endpoint(
+                lambda: DiscoveryProtocol(self.inverter_ip, message),
+                remote_addr=(self.inverter_ip, 58899)
+            )
+            
             try:
-                transport, protocol = await loop.create_datagram_endpoint(
-                    lambda: DiscoveryProtocol(self.inverter_ip, message),
-                    remote_addr=(self.inverter_ip, 58899)
-                )
-
-                try:
-                    await asyncio.wait_for(protocol.response_received, timeout=timeout)
-                    result = protocol.response_received.result()
-                    print(f"UDP discovery result: {result}")
-                    if result:
-                        self._consecutive_udp_failures = 0  # Reset on success
-                        return True
-                except asyncio.TimeoutError:
-                    logger.warning(f"UDP discovery timeout (attempt {attempt + 1}, timeout={timeout}s)")
-                finally:
-                    transport.close()
-
-                await asyncio.sleep(1)  # Short delay between attempts
-            except Exception as e:
-                logger.error(f"UDP discovery error: {str(e)}")
-
-        self._consecutive_udp_failures += 1
-        logger.error(f"UDP discovery failed after all attempts (failure #{self._consecutive_udp_failures})")
-        return False
+                await asyncio.wait_for(protocol.response_received, timeout=2)
+                return True
+            except asyncio.TimeoutError:
+                logger.warning("UDP discovery response timed out")
+                return False
+            finally:
+                transport.close()
+        except Exception as e:
+            logger.error(f"UDP discovery error: {e}")
+            return False
 
     async def _ensure_connection(self) -> bool:
-        """Ensure we have a valid connection, establish one if needed."""
-        current_time = time.time()
-        
-        # Check if connection is stale
-        if self._connection_established and (current_time - self._last_activity) > self._connection_timeout:
-            logger.info("Connection is stale, reconnecting...")
-            await self._cleanup_server()
-            self._connection_established = False
-
-        if not self._connection_established:
-            try:
-                # Find an available port
-                self.port = await self._find_available_port(self.port)
-                
-                # Perform UDP discovery
-                if not await self.send_udp_discovery():
-                    logger.error("UDP discovery failed")
-                    return False
-
-                # Start server and wait for connection
-                self._server = await asyncio.start_server(
-                    self._handle_client_connection,
-                    self.local_ip, self.port
-                )
-                logger.info(f"Server started on {self.local_ip}:{self.port}")
-
-                # Wait for connection with timeout
-                try:
-                    await asyncio.wait_for(self._wait_for_connection(), timeout=10)
-                except asyncio.TimeoutError:
-                    logger.error("Timeout waiting for client connection")
-                    await self._cleanup_server()
-                    return False
-
-            except Exception as e:
-                logger.error(f"Error establishing connection: {e}")
-                await self._cleanup_server()
-                return False
-
-        return self._connection_established
-
-    async def _wait_for_connection(self):
-        """Wait for a client connection to be established."""
-        while not self._connection_established:
-            await asyncio.sleep(0.1)
-
-    async def _handle_client_connection(self, reader, writer):
-        """Handle incoming client connection."""
+        """Ensure TCP connection is established."""
         if self._connection_established:
-            logger.warning("Connection already established, closing new connection")
-            writer.close()
-            await writer.wait_closed()
-            return
+            if time.time() - self._last_activity > self._connection_timeout:
+                logger.debug("Connection stale, cleaning up")
+                await self._cleanup_server()
+            else:
+                logger.debug("Connection already established")
+                return True
+
+        logger.debug("Establishing new connection")
+        
+        # Send UDP discovery
+        if not await self._send_udp_discovery():
+            self._consecutive_udp_failures += 1
+            if self._consecutive_udp_failures >= 3:
+                logger.error("Multiple UDP failures, attempting port change")
+                self.port = await self._find_available_port(self.port + 1)
+                self._consecutive_udp_failures = 0
+            return False
+        
+        self._consecutive_udp_failures = 0
+        
+        # Create TCP server
+        try:
+            self._server = await asyncio.start_server(
+                self._handle_connection,
+                self.local_ip,
+                self.port
+            )
+            logger.debug(f"TCP server listening on {self.local_ip}:{self.port}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to start TCP server: {e}")
+            return False
+
+    async def _handle_connection(self, reader, writer):
+        """Handle incoming client connection."""
+        addr = writer.get_extra_info('peername')
+        logger.info(f"Client connected from {addr}")
+        
+        # If there's an existing connection, close it
+        if self._writer and not self._writer.is_closing():
+            logger.warning("Existing connection found, closing it")
+            self._writer.close()
+            await self._writer.wait_closed()
 
         self._reader = reader
         self._writer = writer
