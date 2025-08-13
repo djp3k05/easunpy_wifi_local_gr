@@ -1,26 +1,40 @@
-# async_isolar.py full code
+# async_isolar.py
 import logging
-from typing import List, Optional, Dict, Tuple, Any
+from typing import Dict, Any, Tuple, Optional
+from datetime import datetime as _dt
+
 from .async_modbusclient import AsyncModbusClient
-from .modbusclient import create_request, decode_modbus_response, create_ascii_request, decode_ascii_response
+from .modbusclient import (
+    create_request,
+    decode_modbus_response,
+    create_ascii_request,
+    decode_ascii_response,
+)
 from .isolar import BatteryData, PVData, GridData, OutputData, SystemStatus, OperatingMode
-import datetime
 from .models import MODEL_CONFIGS, ModelConfig
 
-# Set up logging
-logger = logging.getLogger(__name__)
+_LOGGER = logging.getLogger(__name__)
+
 
 class AsyncISolar:
     """Asynchronous interface to ISolar inverters (Modbus TCP or ASCII)."""
 
     def __init__(self, inverter_ip: str, local_ip: str, model: str = "ISOLAR_SMG_II_11K"):
+        # Port 502 for ASCII/Voltronic, 8899 for Modbus
         port = 502 if model == "VOLTRONIC_ASCII" else 8899
         self.client = AsyncModbusClient(inverter_ip=inverter_ip, local_ip=local_ip, port=port)
+        self._transaction_id = 0x0772
+
+        if model not in MODEL_CONFIGS:
+            raise ValueError(f"Unknown inverter model: {model}")
         self.model = model
-        self.model_config: ModelConfig = MODEL_CONFIGS.get(model)  # type: ignore
-        if not self.model_config:
-            raise ValueError(f"Unknown model: {model}")
-        logger.info(f"AsyncISolar initialized with model: {model} on port {port}")
+        self.model_config: ModelConfig = MODEL_CONFIGS[model]
+        _LOGGER.info(f"AsyncISolar initialized with model: {model} on port {port}")
+
+    def _next_transaction(self) -> int:
+        tid = self._transaction_id
+        self._transaction_id = (tid + 1) & 0xFFFF
+        return tid
 
     async def get_all_data(self) -> Tuple[BatteryData, PVData, GridData, OutputData, SystemStatus]:
         """Fetch all inverter data, either via ASCII or Modbus."""
@@ -28,201 +42,206 @@ class AsyncISolar:
             return await self._get_all_data_ascii()
         return await self._get_all_data_modbus()
 
-    async def _get_all_data_modbus(
-        self,
-    ) -> Tuple[BatteryData, PVData, GridData, OutputData, SystemStatus]:
-        """Fetch data over Modbus registers."""
+    async def _get_all_data_modbus(self) -> Tuple[BatteryData, PVData, GridData, OutputData, SystemStatus]:
+        """Fetch data over Modbus registers (bulk reads)."""
         cfg = self.model_config
-        # Optimize register reads by grouping contiguous registers
-        register_groups: List[Tuple[int, int]] = []
-        current_group: Tuple[int, int] = (cfg.start_register, 0)
-        for reg in cfg.registers:
-            if current_group[1] == 0:
-                current_group = (reg, 1)
-            elif reg == current_group[0] + current_group[1]:
-                current_group = (current_group[0], current_group[1] + 1)
+        # build contiguous register groups
+        groups: list[tuple[int,int]] = []
+        start: Optional[int] = None
+        count = 0
+        for reg in sorted(cfg.register_map.values(), key=lambda rc: rc.address):
+            addr = reg.address
+            if start is None:
+                start, count = addr, 1
+            elif addr == start + count:
+                count += 1
             else:
-                register_groups.append(current_group)
-                current_group = (reg, 1)
-        if current_group[1] > 0:
-            register_groups.append(current_group)
+                groups.append((start, count))
+                start, count = addr, 1
+        if start is not None:
+            groups.append((start, count))
 
-        # Read & decode each group
-        raw_results: Dict[int, List[int]] = {}
-        for start, count in register_groups:
-            request = create_request(self.client.unit_id, start, count)
-            response = await self.client.send(request)
-            values = decode_modbus_response(response, start, count)
-            raw_results.update(values)
+        # send bulk read
+        requests = [
+            create_request(self._next_transaction(), 0, 0x00, 0x03, s, c)
+            for s, c in groups
+        ]
+        responses = await self.client.send_bulk(requests)
+        raw: Dict[int,int] = {}
+        for (s, c), resp in zip(groups, responses):
+            if resp:
+                decoded = decode_modbus_response(resp, s, c)
+                raw.update(decoded)
 
-        # Map registers to values dict
         vals: Dict[str, Any] = {}
-        for name, reg in cfg.register_map.items():
-            vals[name] = raw_results.get(reg)
+        for name, rc in self.model_config.register_map.items():
+            raw_val = raw.get(rc.address)
+            vals[name] = rc.processor(raw_val) if rc.processor else raw_val * rc.scale_factor
 
-        # Build data classes
+        # build dataclasses
         battery = BatteryData(
-            voltage=vals.get("battery_voltage"),
-            current=vals.get("battery_current"),
-            power=vals.get("battery_power"),
-            soc=vals.get("battery_soc"),
-            temperature=vals.get("battery_temperature"),
+            voltage=vals["battery_voltage"],
+            current=vals["battery_current"],
+            power=vals["battery_power"],
+            soc=vals["battery_soc"],
+            temperature=vals["battery_temperature"],
         )
         pv = PVData(
-            total_power=vals.get("pv_total_power"),
-            charging_power=vals.get("pv_charging_power"),
-            charging_current=vals.get("pv_charging_current"),
-            temperature=vals.get("pv_temperature"),
-            pv1_voltage=vals.get("pv1_voltage"),
-            pv1_current=vals.get("pv1_current"),
-            pv1_power=vals.get("pv1_power"),
-            pv2_voltage=vals.get("pv2_voltage"),
-            pv2_current=vals.get("pv2_current"),
-            pv2_power=vals.get("pv2_power"),
-            energy_today=vals.get("pv_energy_today"),
-            energy_total=vals.get("pv_energy_total"),
+            total_power=vals["pv_total_power"],
+            charging_power=vals["pv_charging_power"],
+            charging_current=vals["pv_charging_current"],
+            temperature=vals["pv_temperature"],
+            pv1_voltage=vals["pv1_voltage"],
+            pv1_current=vals["pv1_current"],
+            pv1_power=vals["pv1_power"],
+            pv2_voltage=vals["pv2_voltage"],
+            pv2_current=vals["pv2_current"],
+            pv2_power=vals["pv2_power"],
+            pv_generated_today=vals.get("pv_energy_today", 0),
+            pv_generated_total=vals.get("pv_energy_total", 0),
         )
         grid = GridData(
-            voltage=vals.get("grid_voltage"),
-            power=vals.get("grid_power"),
-            frequency=vals.get("grid_frequency"),
+            voltage=vals["grid_voltage"],
+            power=vals["grid_power"],
+            frequency=vals["grid_frequency"],
         )
         output = OutputData(
-            voltage=vals.get("output_voltage"),
-            current=vals.get("output_current"),
-            power=vals.get("output_power"),
-            apparent_power=vals.get("output_apparent_power"),
-            load_percentage=vals.get("output_load_percentage"),
-            frequency=vals.get("output_frequency"),
+            voltage=vals["output_voltage"],
+            current=vals["output_current"],
+            power=vals["output_power"],
+            apparent_power=vals["output_apparent_power"],
+            load_percentage=vals["output_load_percentage"],
+            frequency=vals["output_frequency"],
         )
-
-        mode_value = vals.get("system_mode")
+        mode = vals.get("system_mode", 0)
         try:
-            op_mode = OperatingMode(mode_value)
-        except Exception:
-            op_mode = OperatingMode.FAULT
-
+            op = OperatingMode(mode)
+        except ValueError:
+            op = OperatingMode.FAULT
         system = SystemStatus(
-            operating_mode=op_mode,
-            mode_name=op_mode.name,
+            operating_mode=op,
+            mode_name=op.name,
             inverter_time=vals.get("inverter_time"),
         )
-
         return battery, pv, grid, output, system
 
-    async def _get_all_data_ascii(
-        self,
-    ) -> Tuple[BatteryData, PVData, GridData, OutputData, SystemStatus]:
+    async def _get_all_data_ascii(self) -> Tuple[BatteryData, PVData, GridData, OutputData, SystemStatus]:
         """Fetch and parse QPIGS/QPIGS2 ASCII data from Voltronic inverters."""
-        # Read primary status
-        raw1 = await self.client.send_ascii("QPIGS")
-        qpigs_parts = raw1.strip().split()
-        # Read second PV string if available
-        raw2 = await self.client.send_ascii("QPIGS2")
-        qpigs2_parts = raw2.strip().split()
+        # build and send ASCII requests
+        req1 = create_ascii_request(self._next_transaction(), 0, "QPIGS")
+        req2 = create_ascii_request(self._next_transaction(), 0, "QPIGS2")
+        # send via send_bulk (which handles our TCP handshake)
+        resps = await self.client.send_bulk([req1, req2])
+        raw1 = decode_ascii_response(resps[0] if resps and resps[0] else "")
+        raw2 = decode_ascii_response(resps[1] if len(resps) > 1 and resps[1] else "")
 
-        # Parse basic fields
-        values: Dict[str, Any] = {}
+        p1 = raw1.split()
+        p2 = raw2.split()
+
+        vals: Dict[str, Any] = {}
         # Battery
-        values["battery_voltage"] = float(qpigs_parts[8])
-        bat_charge = int(qpigs_parts[9])
-        bat_discharge = int(qpigs_parts[15])
-        values["battery_current"] = bat_charge - bat_discharge
-        values["battery_power"] = int(values["battery_voltage"] * values["battery_current"])
-        values["battery_soc"] = int(qpigs_parts[10])
-        # Inverter heat-sink (formerly mislabeled Battery Temperature)
-        values["battery_temperature"] = int(qpigs_parts[11])
+        vals["battery_voltage"] = float(p1[8])
+        ch = int(p1[9])
+        dis = int(p1[15])
+        vals["battery_current"] = ch - dis
+        vals["battery_power"] = int(vals["battery_voltage"] * vals["battery_current"])
+        vals["battery_soc"] = int(p1[10])
+        vals["battery_temperature"] = int(p1[11])  # heat-sink temp
+
         # Output
-        values["output_voltage"] = float(qpigs_parts[2])
-        values["output_current"] = float(qpigs_parts[3])
-        values["output_power"] = int(qpigs_parts[5])
-        values["output_apparent_power"] = int(qpigs_parts[6])
-        values["output_load_percentage"] = int(qpigs_parts[7])
-        values["output_frequency"] = float(qpigs_parts[4])
+        vals["output_voltage"] = float(p1[2])
+        vals["output_current"] = float(p1[3])
+        vals["output_power"] = int(p1[5])
+        vals["output_apparent_power"] = int(p1[6])
+        vals["output_load_percentage"] = int(p1[7])
+        vals["output_frequency"] = float(p1[4])
+
         # PV1
-        values["pv_total_power"] = int(qpigs_parts[12])
-        values["pv_charging_power"] = int(qpigs_parts[12])
-        values["pv_charging_current"] = int(qpigs_parts[13])
-        values["pv_temperature"] = int(qpigs_parts[14])
-        values["pv1_voltage"] = float(qpigs_parts[12])  # reuse same for consistency
-        values["pv1_current"] = float(qpigs_parts[13])
-        values["pv1_power"] = int(qpigs_parts[12])
-        # System
-        mode_value = int(qpigs_parts[17])
+        pv1p = int(p1[12])
+        vals["pv_total_power"] = pv1p
+        vals["pv_charging_power"] = pv1p
+        vals["pv_charging_current"] = int(p1[13])
+        vals["pv_temperature"] = int(p1[14])
+        vals["pv1_voltage"] = float(p1[12])
+        vals["pv1_current"] = float(p1[13])
+        vals["pv1_power"] = pv1p
+
+        # System & time
+        mode = int(p1[17])
         try:
-            op_mode = OperatingMode(mode_value)
+            opm = OperatingMode(mode)
         except ValueError:
-            op_mode = OperatingMode.FAULT
-        inverter_timestamp = datetime.datetime.utcnow().isoformat()
-        values["system_mode"] = mode_value
-        # Grid frequency (not in QPIGS, reuse output freq)
-        values["grid_frequency"] = values["output_frequency"]
-        # Grid voltage not provided in ASCII
-        values["grid_voltage"] = 0.0
+            opm = OperatingMode.FAULT
+        vals["system_mode"] = mode
+        vals["inverter_time"] = _dt.utcnow().isoformat()
+        # ASCII has no grid voltage → zero
+        vals["grid_voltage"] = 0.0
+        # grid_frequency = output_frequency
+        vals["grid_frequency"] = vals["output_frequency"]
 
         # PV2 (if present)
-        pv2_power = 0
-        if len(qpigs2_parts) >= 3:
-            pv2_current = float(qpigs2_parts[0])
-            pv2_voltage = float(qpigs2_parts[1])
-            pv2_power = int(qpigs2_parts[2])
-            values["pv2_voltage"] = pv2_voltage
-            values["pv2_current"] = pv2_current
-            values["pv2_power"] = pv2_power
-            values["pv_total_power"] += pv2_power
-            values["pv_charging_power"] += pv2_power
-            values["pv_charging_current"] += pv2_current
+        pv2p = 0.0
+        if len(p2) >= 3:
+            v2 = float(p2[1])
+            i2 = float(p2[0])
+            pv2p = int(p2[2])
+            vals["pv2_voltage"] = v2
+            vals["pv2_current"] = i2
+            vals["pv2_power"] = pv2p
+            vals["pv_total_power"] += pv2p
+            vals["pv_charging_power"] += pv2p
+            vals["pv_charging_current"] += i2
         else:
-            values["pv2_voltage"] = 0.0
-            values["pv2_current"] = 0.0
-            values["pv2_power"] = 0
+            vals["pv2_voltage"] = 0.0
+            vals["pv2_current"] = 0.0
+            vals["pv2_power"] = 0
 
-        # Calculate net grid power after PV2 inclusion
-        values["grid_power"] = (
-            values["output_power"]
-            + values["battery_power"]
-            - values["pv_charging_power"]
+        # final grid power after including PV2
+        vals["grid_power"] = (
+            vals["output_power"]
+            + vals["battery_power"]
+            - vals["pv_charging_power"]
         )
 
-        # Build data classes
+        # Build dataclasses
         battery = BatteryData(
-            voltage=values["battery_voltage"],
-            current=values["battery_current"],
-            power=values["battery_power"],
-            soc=values["battery_soc"],
-            temperature=values["battery_temperature"],
+            voltage=vals["battery_voltage"],
+            current=vals["battery_current"],
+            power=vals["battery_power"],
+            soc=vals["battery_soc"],
+            temperature=vals["battery_temperature"],
         )
         pv = PVData(
-            total_power=values["pv_total_power"],
-            charging_power=values["pv_charging_power"],
-            charging_current=values["pv_charging_current"],
-            temperature=values["pv_temperature"],
-            pv1_voltage=values["pv1_voltage"],
-            pv1_current=values["pv1_current"],
-            pv1_power=values["pv1_power"],
-            pv2_voltage=values["pv2_voltage"],
-            pv2_current=values["pv2_current"],
-            pv2_power=values["pv2_power"],
-            energy_today=0.0,
-            energy_total=0.0,
+            total_power=vals["pv_total_power"],
+            charging_power=vals["pv_charging_power"],
+            charging_current=vals["pv_charging_current"],
+            temperature=vals["pv_temperature"],
+            pv1_voltage=vals["pv1_voltage"],
+            pv1_current=int(vals["pv1_current"]),
+            pv1_power=int(vals["pv1_power"]),
+            pv2_voltage=vals["pv2_voltage"],
+            pv2_current=int(vals["pv2_current"]),
+            pv2_power=int(vals["pv2_power"]),
+            pv_generated_today=None,
+            pv_generated_total=None,
         )
         grid = GridData(
-            voltage=values["grid_voltage"],
-            power=values["grid_power"],
-            frequency=values["grid_frequency"],
+            voltage=vals["grid_voltage"],
+            power=vals["grid_power"],
+            frequency=int(vals["grid_frequency"]),
         )
         output = OutputData(
-            voltage=values["output_voltage"],
-            current=values["output_current"],
-            power=values["output_power"],
-            apparent_power=values["output_apparent_power"],
-            load_percentage=values["output_load_percentage"],
-            frequency=values["output_frequency"],
+            voltage=vals["output_voltage"],
+            current=vals["output_current"],
+            power=vals["output_power"],
+            apparent_power=vals["output_apparent_power"],
+            load_percentage=vals["output_load_percentage"],
+            frequency=int(vals["output_frequency"]),
         )
         system = SystemStatus(
-            operating_mode=op_mode,
-            mode_name=op_mode.name,
-            inverter_time=inverter_timestamp,
+            operating_mode=opm,
+            mode_name=opm.name,
+            inverter_time=vals["inverter_time"],
         )
 
         return battery, pv, grid, output, system
