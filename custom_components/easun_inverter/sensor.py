@@ -15,7 +15,7 @@ from homeassistant.const import (
     UnitOfElectricPotential,
     UnitOfTemperature,
     UnitOfFrequency,
-    UnitOfAppparentPower as UnitOfApparentPower,
+    UnitOfApparentPower,
     UnitOfEnergy,
     PERCENTAGE,
 )
@@ -62,10 +62,9 @@ class DataCollector:
     async def update_data(self) -> None:
         """Fetch all data from the inverter asynchronously using bulk request."""
         if self._lock.locked():
-            _LOGGER.warning("Could not acquire lock for update")
+            _LOGGER.warning("Previous update still in progress, skipping")
             return
 
-        # Acquire the lock before starting the update
         await self._lock.acquire()
         try:
             update_task = asyncio.create_task(self._do_update())
@@ -77,7 +76,7 @@ class DataCollector:
                 self._last_successful_update = datetime.now()
                 self._consecutive_failures = 0
             except asyncio.TimeoutError:
-                _LOGGER.error("Update timed out, cancelling task")
+                _LOGGER.error("Data update timed out")
                 update_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await update_task
@@ -86,7 +85,7 @@ class DataCollector:
                 self._consecutive_failures += 1
                 if self._consecutive_failures >= self._max_consecutive_failures:
                     _LOGGER.critical(
-                        f"Max consecutive failures reached ({self._max_consecutive_failures})."
+                        f"Max consecutive failures reached ({self._max_consecutive_failures})"
                     )
         finally:
             self._lock.release()
@@ -94,16 +93,16 @@ class DataCollector:
     async def _do_update(self) -> None:
         """Perform the actual data update."""
         battery, pv, grid, output, status = await self._isolar.get_all_data()
-        self._data["battery"] = battery.__dict__ if battery else None
-        self._data["pv"] = pv.__dict__ if pv else None
-        self._data["grid"] = grid.__dict__ if grid else None
-        self._data["output"] = output.__dict__ if output else None
-        self._data["system"] = status.__dict__ if status else None
+        self._data["battery"] = battery.__dict__ if battery else {}
+        self._data["pv"] = pv.__dict__ if pv else {}
+        self._data["grid"] = grid.__dict__ if grid else {}
+        self._data["output"] = output.__dict__ if output else {}
+        self._data["system"] = status.__dict__ if status else {}
 
     def get_data(self, section: str, key: str):
         """Get data from a specific section and key."""
-        section_data = self._data.get(section)
-        return section_data.get(key) if section_data else None
+        section_data = self._data.get(section, {})
+        return section_data.get(key)
 
 
 class EasunSensor(SensorEntity):
@@ -238,7 +237,7 @@ async def async_setup_entry(
     hass.data[DOMAIN][entry_id] = {"coordinator": data_collector}
 
     # Build sensor entities
-    frequency_converter = lambda v: v / 100 if v is not None else None
+    frequency_converter = lambda v: (v / 100) if v is not None else None
     entities: list[SensorEntity] = [
         EasunSensor(data_collector, "battery_voltage", "Battery Voltage", UnitOfElectricPotential.VOLT, "battery", "voltage"),
         EasunSensor(data_collector, "battery_current", "Battery Current", UnitOfElectricCurrent.AMPERE, "battery", "current"),
