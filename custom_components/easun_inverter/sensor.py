@@ -19,8 +19,6 @@ from homeassistant.const import (
     PERCENTAGE,
 )
 from homeassistant.core import HomeAssistant
-    # above line intentionally indented? Fix.
-from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
@@ -81,9 +79,18 @@ class DataCollector:
                 update_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await update_task
+                # Ensure the server socket is torn down so we can rebind next cycle
+                try:
+                    await self._isolar.client._cleanup_server()
+                except Exception:
+                    pass
             except Exception as e:
                 _LOGGER.error(f"Error during data update: {e}")
                 self._consecutive_failures += 1
+                try:
+                    await self._isolar.client._cleanup_server()
+                except Exception:
+                    pass
                 if self._consecutive_failures >= self._max_consecutive_failures:
                     _LOGGER.critical(
                         f"Max consecutive failures reached ({self._max_consecutive_failures})"
@@ -236,15 +243,14 @@ async def async_setup_entry(
     # Ensure domain data structure exists
     hass.data.setdefault(DOMAIN, {})[entry_id] = {"coordinator": data_collector}
 
-    # Base sensors (existing)
-    frequency_converter = lambda v: (v / 100) if v is not None else None
+    # Build base sensor entities
+    freq_conv = lambda v: (v / 100) if v is not None else None
     entities: list[SensorEntity] = [
         # Battery
         EasunSensor(data_collector, "battery_voltage", "Battery Voltage", UnitOfElectricPotential.VOLT, "battery", "voltage"),
         EasunSensor(data_collector, "battery_current", "Battery Current", UnitOfElectricCurrent.AMPERE, "battery", "current"),
         EasunSensor(data_collector, "battery_power", "Battery Power", UnitOfPower.WATT, "battery", "power"),
         EasunSensor(data_collector, "battery_soc", "Battery SoC", PERCENTAGE, "battery", "soc"),
-        # Inverter heatsink temp exposed as "Inverter Temperature"
         EasunSensor(data_collector, "battery_temperature", "Inverter Temperature", UnitOfTemperature.CELSIUS, "battery", "temperature"),
         # PV
         EasunSensor(data_collector, "pv_total_power", "PV Total Power", UnitOfPower.WATT, "pv", "total_power"),
@@ -259,39 +265,34 @@ async def async_setup_entry(
         EasunSensor(data_collector, "pv2_power", "PV2 Power", UnitOfPower.WATT, "pv", "pv2_power"),
         EasunSensor(data_collector, "pv_energy_today", "PV Generated Today", UnitOfEnergy.KILO_WATT_HOUR, "pv", "pv_generated_today"),
         EasunSensor(data_collector, "pv_energy_total", "PV Generated Total", UnitOfEnergy.KILO_WATT_HOUR, "pv", "pv_generated_total"),
-        # Grid
+        # Grid / Output
         EasunSensor(data_collector, "grid_voltage", "Grid Voltage", UnitOfElectricPotential.VOLT, "grid", "voltage"),
         EasunSensor(data_collector, "grid_power", "Grid Power", UnitOfPower.WATT, "grid", "power"),
-        EasunSensor(data_collector, "grid_frequency", "Grid Frequency", UnitOfFrequency.HERTZ, "grid", "frequency", frequency_converter),
-        # Output
+        EasunSensor(data_collector, "grid_frequency", "Grid Frequency", UnitOfFrequency.HERTZ, "grid", "frequency", freq_conv),
         EasunSensor(data_collector, "output_voltage", "Output Voltage", UnitOfElectricPotential.VOLT, "output", "voltage"),
         EasunSensor(data_collector, "output_current", "Output Current", UnitOfElectricCurrent.AMPERE, "output", "current"),
         EasunSensor(data_collector, "output_power", "Output Power", UnitOfPower.WATT, "output", "power"),
         EasunSensor(data_collector, "output_apparent_power", "Output Apparent Power", UnitOfApparentPower.VOLT_AMPERE, "output", "apparent_power"),
         EasunSensor(data_collector, "output_load_percentage", "Output Load Percentage", PERCENTAGE, "output", "load_percentage"),
-        EasunSensor(data_collector, "output_frequency", "Output Frequency", UnitOfFrequency.HERTZ, "output", "frequency", frequency_converter),
+        EasunSensor(data_collector, "output_frequency", "Output Frequency", UnitOfFrequency.HERTZ, "output", "frequency", freq_conv),
         # System
         EasunSensor(data_collector, "operating_mode", "Operating Mode", None, "system", "mode_name"),
         EasunSensor(data_collector, "inverter_time", "Inverter Time", None, "system", "inverter_time"),
-        # Diagnostics
         RegisterScanSensor(hass),
         DeviceScanSensor(hass),
     ]
 
-    # ASCII (Voltronic) extras – only add when using VOLTRONIC_ASCII so we don't show Unknown on Modbus models
-    if isolar.model == "VOLTRONIC_ASCII":
+    # Extra sensors only meaningful for the VOLTRONIC_ASCII model (ASCII commands)
+    if model == "VOLTRONIC_ASCII":
         ascii_entities: list[SensorEntity] = [
-            # QPIGS extras
+            # Extra QPIGS
             EasunSensor(data_collector, "bus_voltage", "Bus Voltage", UnitOfElectricPotential.VOLT, "system", "bus_voltage"),
-            EasunSensor(data_collector, "battery_charge_current", "Battery Charge Current", UnitOfElectricCurrent.AMPERE, "battery", "charge_current"),
-            EasunSensor(data_collector, "battery_discharge_current", "Battery Discharge Current", UnitOfElectricCurrent.AMPERE, "battery", "discharge_current"),
-            EasunSensor(data_collector, "scc_battery_voltage", "Battery Voltage (SCC)", UnitOfElectricPotential.VOLT, "battery", "scc_voltage"),
+            EasunSensor(data_collector, "battery_voltage_scc", "Battery Voltage (SCC)", UnitOfElectricPotential.VOLT, "system", "battery_voltage_from_scc"),
+            EasunSensor(data_collector, "battery_voltage_offset_fans", "Battery Voltage Offset for Fans", None, "system", "battery_voltage_offset_fans"),
             EasunSensor(data_collector, "eeprom_version", "EEPROM Version", None, "system", "eeprom_version"),
-            EasunSensor(data_collector, "device_status", "Device Status Flags", None, "system", "device_status"),
-            EasunSensor(data_collector, "device_status_2", "Device Status 2 Flags", None, "system", "device_status_2"),
-            # QPIWS
-            EasunSensor(data_collector, "warnings", "Warnings", None, "system", "warnings"),
-            # QPIRI ratings/settings
+            EasunSensor(data_collector, "device_status_flags", "Device Status Flags", None, "system", "device_status_flags"),
+            EasunSensor(data_collector, "device_status_flags2", "Device Status Flags 2", None, "system", "device_status_flags_2"),
+            # QPIRI (ratings)
             EasunSensor(data_collector, "grid_rating_voltage", "Grid Rating Voltage", UnitOfElectricPotential.VOLT, "system", "grid_rating_voltage"),
             EasunSensor(data_collector, "grid_rating_current", "Grid Rating Current", UnitOfElectricCurrent.AMPERE, "system", "grid_rating_current"),
             EasunSensor(data_collector, "ac_output_rating_voltage", "AC Output Rating Voltage", UnitOfElectricPotential.VOLT, "system", "ac_output_rating_voltage"),
@@ -304,9 +305,11 @@ async def async_setup_entry(
             EasunSensor(data_collector, "battery_under_voltage", "Battery Under Voltage", UnitOfElectricPotential.VOLT, "system", "battery_under_voltage"),
             EasunSensor(data_collector, "battery_bulk_voltage", "Battery Bulk Voltage", UnitOfElectricPotential.VOLT, "system", "battery_bulk_voltage"),
             EasunSensor(data_collector, "battery_float_voltage", "Battery Float Voltage", UnitOfElectricPotential.VOLT, "system", "battery_float_voltage"),
+            EasunSensor(data_collector, "battery_re_discharge_voltage", "Battery Re-Discharge Voltage", UnitOfElectricPotential.VOLT, "system", "battery_re_discharge_voltage"),
             EasunSensor(data_collector, "battery_type", "Battery Type", None, "system", "battery_type"),
             EasunSensor(data_collector, "max_ac_charging_current", "Max AC Charging Current", UnitOfElectricCurrent.AMPERE, "system", "max_ac_charging_current"),
             EasunSensor(data_collector, "max_charging_current", "Max Charging Current", UnitOfElectricCurrent.AMPERE, "system", "max_charging_current"),
+            EasunSensor(data_collector, "max_discharging_current", "Max Discharging Current", UnitOfElectricCurrent.AMPERE, "system", "max_discharging_current"),
             EasunSensor(data_collector, "input_voltage_range", "Input Voltage Range", None, "system", "input_voltage_range"),
             EasunSensor(data_collector, "output_source_priority", "Output Source Priority", None, "system", "output_source_priority"),
             EasunSensor(data_collector, "charger_source_priority", "Charger Source Priority", None, "system", "charger_source_priority"),
@@ -314,11 +317,11 @@ async def async_setup_entry(
             EasunSensor(data_collector, "machine_type", "Machine Type", None, "system", "machine_type"),
             EasunSensor(data_collector, "topology", "Topology", None, "system", "topology"),
             EasunSensor(data_collector, "output_mode", "Output Mode (QPIRI)", None, "system", "output_mode"),
-            EasunSensor(data_collector, "battery_re_discharge_voltage", "Battery Re-Discharge Voltage", UnitOfElectricPotential.VOLT, "system", "battery_re_discharge_voltage"),
             EasunSensor(data_collector, "pv_ok_condition", "PV OK Condition", None, "system", "pv_ok_condition"),
             EasunSensor(data_collector, "pv_power_balance", "PV Power Balance", None, "system", "pv_power_balance"),
-            EasunSensor(data_collector, "max_charging_time_cv", "Max Charging Time (CV Stage)", None, "system", "max_charging_time_cv"),
-            EasunSensor(data_collector, "max_discharging_current", "Max Discharging Current", UnitOfElectricCurrent.AMPERE, "system", "max_discharging_current"),
+            EasunSensor(data_collector, "max_charging_time_cv", "Max Charging Time at CV", None, "system", "max_charging_time_cv"),
+            # QPIWS
+            EasunSensor(data_collector, "warnings_text", "Warnings", None, "system", "warnings_text"),
         ]
         entities.extend(ascii_entities)
 
@@ -341,7 +344,6 @@ async def async_setup_entry(
 
         try:
             await data_collector.update_data()
-            # write new state back into HA on your interval
             for sensor in entities:
                 sensor.async_write_ha_state()
         except Exception as err:
