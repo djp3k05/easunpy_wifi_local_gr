@@ -43,6 +43,7 @@ class AsyncModbusClient:
         self._connection_established = False
         self._last_activity = 0
         self._connection_timeout = 30  # Timeout in seconds before considering connection stale
+        self._connection_future = None
 
     async def _cleanup_server(self):
         """Cleanup server and all active connections."""
@@ -73,6 +74,7 @@ class AsyncModbusClient:
                     logger.debug(f"Error closing server: {e}")
                 finally:
                     self._server = None
+            await asyncio.sleep(1)  # Give time for port to be released
         except Exception as e:
             logger.debug(f"Error during cleanup: {e}")
         finally:
@@ -81,6 +83,8 @@ class AsyncModbusClient:
             self._connection_established = False
             self._reader = None
             self._writer = None
+            if self._connection_future and not self._connection_future.done():
+                self._connection_future.set_result(False)
 
     async def _find_available_port(self, start_port: int = 8899, max_attempts: int = 20) -> int:
         """Find an available port starting from the given port."""
@@ -141,13 +145,21 @@ class AsyncModbusClient:
         
         # Create TCP server
         try:
+            self._connection_future = asyncio.Future()
             self._server = await asyncio.start_server(
                 self._handle_connection,
                 self.local_ip,
                 self.port
             )
             logger.debug(f"TCP server listening on {self.local_ip}:{self.port}")
-            return True
+            # Wait for connection with timeout
+            try:
+                await asyncio.wait_for(self._connection_future, timeout=5)
+                return True
+            except asyncio.TimeoutError:
+                logger.warning("Timeout waiting for client connection")
+                await self._cleanup_server()
+                return False
         except Exception as e:
             logger.error(f"Failed to start TCP server: {e}")
             return False
@@ -169,6 +181,8 @@ class AsyncModbusClient:
         self._last_activity = time.time()
         self._active_connections.add(writer)
         logger.info("Client connection established")
+        if self._connection_future and not self._connection_future.done():
+            self._connection_future.set_result(True)
 
     async def send_bulk(self, hex_commands: list[str], retry_count: int = 5) -> list[str]:
         """Send multiple Modbus TCP commands using persistent connection."""
