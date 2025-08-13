@@ -45,12 +45,14 @@ class AsyncISolar:
     ) -> list[Optional[list[int]]]:
         """Read multiple groups of registers in a single connection."""
         try:
+            # Create requests for each register group
             requests = [
                 create_request(self._get_next_transaction_id(), 0x0001, 0x00, 0x03, start, count)
                 for start, count in register_groups
             ]
             logger.debug(f"Sending bulk request for register groups: {register_groups}")
             responses = await self.client.send_bulk(requests)
+            
             decoded_groups: list[Optional[list[int]]] = [None] * len(register_groups)
             for i, (response, (_, count)) in enumerate(zip(responses, register_groups)):
                 try:
@@ -91,103 +93,90 @@ class AsyncISolar:
         if not qpigs_raw or not qmod_raw:
             raise ValueError("Invalid responses from inverter")
 
-        # Clean up leading '('
+        # Strip leading '('
         qpigs_raw = qpigs_raw.lstrip('(')
         qpigs2_raw = qpigs2_raw.lstrip('(') if qpigs2_raw else ""
         qmod = qmod_raw.lstrip('(')
 
-        # Split into fields
         qpigs_parts = qpigs_raw.split(' ')
         qpigs2_parts = qpigs2_raw.split(' ') if qpigs2_raw else []
 
         values: Dict[str, Any] = {}
 
-        # Must have at least 21 fields
-        if len(qpigs_parts) >= 21:
-            # Grid / Output
-            values["grid_voltage"]        = float(qpigs_parts[0])
-            values["grid_frequency"]      = float(qpigs_parts[1]) * 100
-            values["output_voltage"]      = float(qpigs_parts[2])
-            values["output_frequency"]    = float(qpigs_parts[3]) * 100
-            values["output_apparent_power"]= int(qpigs_parts[4])
-            values["output_power"]        = int(qpigs_parts[5])
-            values["output_load_percentage"]= int(qpigs_parts[6])
-
-            # Battery
-            values["battery_voltage"]     = float(qpigs_parts[8])
-            battery_chg = int(qpigs_parts[9])
-            values["battery_soc"]         = int(qpigs_parts[10])
-            inverter_heat_sink_temp       = int(qpigs_parts[11])
-            # Use heat-sink as "battery temperature"
-            values["battery_temperature"] = inverter_heat_sink_temp
-            values["pv_temperature"]      = inverter_heat_sink_temp
-            # we’ll compute current & power next
-
-            # Raw PV1 fields
-            pv1_voltage = float(qpigs_parts[13])
-            pv_chg_current_raw = float(qpigs_parts[12])
-            # Correct parsing of charging power: ASCII gives kW with one decimal, e.g. '05.5'
-            pv_chg_kw = float(qpigs_parts[19])
-            pv_chg_power = int(pv_chg_kw * 1000)  # convert to W
-
-            # Fill in PV1 & battery metrics
-            values["pv_total_power"]      = pv_chg_power
-            values["pv_charging_power"]   = pv_chg_power
-            values["pv_charging_current"] = pv_chg_current_raw
-            values["pv1_voltage"]         = pv1_voltage
-            values["pv1_current"]         = pv_chg_power / pv1_voltage if pv1_voltage > 0 else 0
-            values["pv1_power"]           = pv_chg_power
-
-            # Battery net current & power
-            battery_dis = int(qpigs_parts[15])
-            values["battery_current"]     = battery_chg - battery_dis
-            values["battery_power"]       = int(values["battery_voltage"] * values["battery_current"])
-
-            # Output current (approx)
-            values["output_current"]      = (
-                values["output_power"] / values["output_voltage"]
-                if values["output_voltage"] > 0
-                else 0
-            )
-
-            # Default grid_power for now; we will recalc after PV2
-            # values["grid_power"] = (
-            #     values["output_power"]
-            #   + values["battery_power"]
-            #   - values["pv_charging_power"]
-            # )
-
-            # PV2 (if present)
-            if len(qpigs2_parts) >= 3:
-                pv2_curr = float(qpigs2_parts[0])
-                pv2_volt = float(qpigs2_parts[1])
-                pv2_kw   = float(qpigs2_parts[2])
-                pv2_p    = int(pv2_kw * 1000)
-                values["pv2_voltage"]     = pv2_volt
-                values["pv2_current"]     = pv2_curr
-                values["pv2_power"]       = pv2_p
-                values["pv_total_power"] += pv2_p
-                values["pv_charging_power"] += pv2_p
-                values["pv_charging_current"] += pv2_curr
-            else:
-                values["pv2_voltage"]     = 0.0
-                values["pv2_current"]     = 0.0
-                values["pv2_power"]       = 0
-
-            # Now that PV1+PV2 is in pv_charging_power, recalc net grid power:
-            values["grid_power"] = (
-                values["output_power"]
-                + values["battery_power"]
-                - values["pv_charging_power"]
-            )
-
-            # No energy stats from ASCII
-            values["pv_energy_today"] = None
-            values["pv_energy_total"] = None
-        else:
+        if len(qpigs_parts) < 21:
             raise ValueError("Invalid QPIGS response")
 
-        # System status from QMOD
+        # 1) Battery
+        values["battery_voltage"]     = float(qpigs_parts[8])
+        battery_chg                  = float(qpigs_parts[9])
+        battery_dis                  = float(qpigs_parts[15])
+        values["battery_current"]     = battery_chg - battery_dis
+        values["battery_power"]       = int(values["battery_voltage"] * values["battery_current"])
+        values["battery_soc"]         = int(qpigs_parts[10])
+        # rename: internal inverter temp
+        values["battery_temperature"] = int(qpigs_parts[11])
+        values["pv_temperature"]      = values["battery_temperature"]
+
+        # 2) PV1
+        pv1_curr_raw                  = float(qpigs_parts[12])
+        pv1_volt                      = float(qpigs_parts[13])
+        raw_pv1                       = qpigs_parts[19]
+        if "." in raw_pv1:
+            pv1_power = int(float(raw_pv1) * 1000)
+        else:
+            pv1_power = int(raw_pv1)
+
+        values["pv_total_power"]      = pv1_power
+        values["pv_charging_power"]   = pv1_power
+        values["pv_charging_current"] = pv1_curr_raw
+        values["pv1_voltage"]         = pv1_volt
+        values["pv1_current"]         = pv1_curr_raw
+        values["pv1_power"]           = pv1_power
+
+        # 3) PV2 (if present)
+        if len(qpigs2_parts) >= 3:
+            pv2_curr_raw              = float(qpigs2_parts[0])
+            pv2_volt                  = float(qpigs2_parts[1])
+            raw_pv2                   = qpigs2_parts[2]
+            if "." in raw_pv2:
+                pv2_power = int(float(raw_pv2) * 1000)
+            else:
+                pv2_power = int(raw_pv2)
+            values["pv2_voltage"]       = pv2_volt
+            values["pv2_current"]       = pv2_curr_raw
+            values["pv2_power"]         = pv2_power
+            values["pv_total_power"]   += pv2_power
+            values["pv_charging_power"]+= pv2_power
+            values["pv_charging_current"] += pv2_curr_raw
+        else:
+            values["pv2_voltage"]       = 0.0
+            values["pv2_current"]       = 0.0
+            values["pv2_power"]         = 0
+
+        # 4) Grid (net import/export)
+        values["grid_power"]          = (
+            values["output_power"]
+            + values["battery_power"]
+            - values["pv_charging_power"]
+        )
+        # 5) Output & Grid basic
+        values["grid_voltage"]        = float(qpigs_parts[0])
+        values["grid_frequency"]      = float(qpigs_parts[1]) * 100
+        values["output_voltage"]      = float(qpigs_parts[2])
+        values["output_frequency"]    = float(qpigs_parts[3]) * 100
+        values["output_apparent_power"]= int(qpigs_parts[4])
+        values["output_power"]        = int(qpigs_parts[5])
+        values["output_load_percentage"]= int(qpigs_parts[6])
+        values["output_current"]      = (
+            values["output_power"] / values["output_voltage"]
+            if values["output_voltage"] > 0 else 0
+        )
+
+        # QPIGS/QPIGS2 have no energy stats
+        values["pv_energy_today"]     = None
+        values["pv_energy_total"]     = None
+
+        # System status (QMOD)
         if qmod in ['L', 'C']:
             values["operation_mode"] = 2
             values["mode_name"]      = "Line Mode" if qmod == 'L' else "Charging Mode"
@@ -197,8 +186,7 @@ class AsyncISolar:
         else:
             values["operation_mode"] = 0
             values["mode_name"]      = f"UNKNOWN ({qmod})"
-
-        values["inverter_time"] = None
+        values["inverter_time"]       = None
 
         # Build dataclasses
         battery = self._create_battery_data(values)
@@ -217,20 +205,20 @@ class AsyncISolar:
         Optional[OutputData],
         Optional[SystemStatus],
     ]:
-        """Get all inverter data in a single call."""
+        """Get all inverter data in a single bulk request."""
         if self.model == "VOLTRONIC_ASCII":
             return await self._get_all_data_ascii()
-        # Group consecutive registers to minimize requests
+
+        # Existing Modbus branch unchanged
         register_groups = []
         current_group = None
-        
-        # Get all unique registers from the config, sorted
-        registers = sorted(set(
-            self.model_config.get_address(name) 
-            for name in self.model_config.register_map.keys()
-            if self.model_config.get_address(name) is not None and self.model_config.get_address(name) > 0
-        ))
-        
+        registers = sorted(
+            set(
+                self.model_config.get_address(name)
+                for name in self.model_config.register_map.keys()
+                if self.model_config.get_address(name) is not None and self.model_config.get_address(name) > 0
+            )
+        )
         for reg in registers:
             if current_group is None:
                 current_group = (reg, 1)
@@ -239,55 +227,36 @@ class AsyncISolar:
             else:
                 register_groups.append(current_group)
                 current_group = (reg, 1)
-        
         if current_group:
             register_groups.append(current_group)
-        
         if not register_groups:
             logger.warning("No registers defined for model")
             return None, None, None, None, None
-        
         logger.debug(f"Optimized register groups: {register_groups}")
-        
-        # Read all groups
         decoded_groups = await self._read_registers_bulk(register_groups)
-        
-        # Flatten all decoded values into a single list
         all_values = []
         for group in decoded_groups:
             if group is not None:
                 all_values.extend(group)
-        
-        # Create a mapping of register address to value
         reg_to_value = {}
         current_reg = register_groups[0][0] if register_groups else 0
         for value in all_values:
             reg_to_value[current_reg] = value
             current_reg += 1
-        
-        # Process values according to config
         processed_values = {}
         for reg_name, config in self.model_config.register_map.items():
             addr = config.address
-            if addr == 0 or addr is None:
-                continue
-            raw_value = reg_to_value.get(addr)
-            if raw_value is not None:
+            if addr and addr in reg_to_value:
+                raw_value = reg_to_value[addr]
                 processed_values[reg_name] = self.model_config.process_value(reg_name, raw_value)
-            else:
-                logger.warning(f"No value for register {reg_name} at address {addr}")
-        
         logger.debug(f"Processed values: {processed_values}")
-        
-        # Create data objects
         battery = self._create_battery_data(processed_values)
-        pv = self._create_pv_data(processed_values)
-        grid = self._create_grid_data(processed_values)
-        output = self._create_output_data(processed_values)
-        status = self._create_system_status(processed_values)
-        
+        pv      = self._create_pv_data(processed_values)
+        grid    = self._create_grid_data(processed_values)
+        output  = self._create_output_data(processed_values)
+        status  = self._create_system_status(processed_values)
         return battery, pv, grid, output, status
-        
+  
     def _create_battery_data(self, values: Dict[str, Any]) -> Optional[BatteryData]:
         """Create BatteryData object from processed values."""
         try:
