@@ -13,67 +13,68 @@ from .const import DOMAIN, SIGNAL_COLLECTOR_UPDATED
 _LOGGER = logging.getLogger(__name__)
 
 
+def _get_status_value(hass: HomeAssistant, entry_id: str, *keys: str):
+    c = hass.data.get(DOMAIN, {}).get(entry_id)
+    status = getattr(c, "last_status", None) if c else None
+    if status is None:
+        return None
+    for k in keys:
+        if hasattr(status, k):
+            v = getattr(status, k)
+            if v is not None:
+                return v
+        if isinstance(status, dict) and k in status and status[k] is not None:
+            return status[k]
+    return None
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities) -> None:
     entry_id = entry.entry_id
 
-    def N(name: str, unit: str, native_step: float, getter: Callable, setter: Callable, min_v: float, max_v: float):
-        return SettingNumber(hass, entry_id, name, unit, native_step, getter, setter, min_v, max_v)
+    def N(
+        name: str,
+        unit: str,
+        native_step: float,
+        read_key: Optional[str],
+        setter: Callable,
+        min_v: float,
+        max_v: float,
+    ):
+        return SettingNumber(hass, entry_id, name, unit, native_step, read_key, setter, min_v, max_v)
 
     entities = [
-        N("Battery Re-Charge Voltage", "V", 0.1,
-          lambda c: getattr(c.last_status, "battery_recharge_voltage", None),
-          lambda iso, v: iso.set_battery_recharge_voltage(v),
-          22.0, 62.0),
+        N("Battery Re-Charge Voltage", "V", 0.1, "battery_recharge_voltage",
+          lambda iso, v: iso.set_battery_recharge_voltage(v), 22.0, 62.0),
 
-        N("Battery Re-Discharge Voltage", "V", 0.1,
-          lambda c: getattr(c.last_status, "battery_redischarge_voltage", None),
-          lambda iso, v: iso.set_battery_redischarge_voltage(v),
-          0.0, 62.0),
+        N("Battery Re-Discharge Voltage", "V", 0.1, "battery_redischarge_voltage",
+          lambda iso, v: iso.set_battery_redischarge_voltage(v), 0.0, 62.0),
 
-        N("Battery Cut-Off Voltage", "V", 0.1,
-          lambda c: None,  # not readable via QPIRI on many firmwares
-          lambda iso, v: iso.set_battery_cutoff_voltage(v),
-          36.0, 48.0),
+        N("Battery Cut-Off Voltage", "V", 0.1, None,
+          lambda iso, v: iso.set_battery_cutoff_voltage(v), 36.0, 48.0),
 
-        N("Battery Bulk/CV Voltage", "V", 0.1,
-          lambda c: getattr(c.last_status, "battery_bulk_voltage", None),
-          lambda iso, v: iso.set_battery_bulk_voltage(v),
-          24.0, 64.0),
+        N("Battery Bulk/CV Voltage", "V", 0.1, "battery_bulk_voltage",
+          lambda iso, v: iso.set_battery_bulk_voltage(v), 24.0, 64.0),
 
-        N("Battery Float Voltage", "V", 0.1,
-          lambda c: getattr(c.last_status, "battery_float_voltage", None),
-          lambda iso, v: iso.set_battery_float_voltage(v),
-          24.0, 64.0),
+        N("Battery Float Voltage", "V", 0.1, "battery_float_voltage",
+          lambda iso, v: iso.set_battery_float_voltage(v), 24.0, 64.0),
 
-        N("Max Charging Time at CV", "min", 5,
-          lambda c: getattr(c.last_status, "max_charging_time_cv", None),
-          lambda iso, v: iso.set_cv_stage_max_time(int(v)),
-          0, 900),
+        N("Max Charging Time at CV", "min", 5, "max_charging_time_cv",
+          lambda iso, v: iso.set_cv_stage_max_time(int(v)), 0, 900),
 
-        N("Max Charging Current", "A", 1,
-          lambda c: getattr(c.last_status, "max_charging_current", None),
-          lambda iso, v: iso.set_max_charging_current(int(v)),
-          0, 150),
+        N("Max Charging Current", "A", 1, "max_charging_current",
+          lambda iso, v: iso.set_max_charging_current(int(v)), 0, 150),
 
-        N("Max Utility Charging Current", "A", 1,
-          lambda c: getattr(c.last_status, "max_ac_charging_current", None),
-          lambda iso, v: iso.set_max_utility_charging_current(int(v)),
-          0, 30),
+        N("Max Utility Charging Current", "A", 1, "max_ac_charging_current",
+          lambda iso, v: iso.set_max_utility_charging_current(int(v)), 0, 30),
 
-        N("Max Discharging Current", "A", 1,
-          lambda c: getattr(c.last_status, "max_discharging_current", None),
-          lambda iso, v: iso.set_max_discharge_current(int(v)),
-          0, 150),
+        N("Max Discharging Current", "A", 1, "max_discharging_current",
+          lambda iso, v: iso.set_max_discharge_current(int(v)), 0, 150),
 
         # Equalization values (usually not readable)
-        N("Equalization Time", "min", 5,
-          lambda c: None, lambda iso, v: iso.equalization_set_time(int(v)), 5, 900),
-        N("Equalization Period", "days", 1,
-          lambda c: None, lambda iso, v: iso.equalization_set_period(int(v)), 0, 90),
-        N("Equalization Voltage", "V", 0.01,
-          lambda c: None, lambda iso, v: iso.equalization_set_voltage(float(v)), 24.0, 64.0),
-        N("Equalization Over Time", "min", 5,
-          lambda c: None, lambda iso, v: iso.equalization_set_over_time(int(v)), 5, 900),
+        N("Equalization Time", "min", 5, None, lambda iso, v: iso.equalization_set_time(int(v)), 5, 900),
+        N("Equalization Period", "days", 1, None, lambda iso, v: iso.equalization_set_period(int(v)), 0, 90),
+        N("Equalization Voltage", "V", 0.01, None, lambda iso, v: iso.equalization_set_voltage(float(v)), 24.0, 64.0),
+        N("Equalization Over Time", "min", 5, None, lambda iso, v: iso.equalization_set_over_time(int(v)), 5, 900),
     ]
 
     async_add_entities(entities)
@@ -83,12 +84,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 class SettingNumber(NumberEntity):
     _attr_should_poll = False
 
-    def __init__(self, hass: HomeAssistant, entry_id: str, name: str, unit: str, step: float, getter, setter, min_v, max_v):
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry_id: str,
+        name: str,
+        unit: str,
+        step: float,
+        read_key: Optional[str],
+        setter: Callable,
+        min_v: float,
+        max_v: float,
+    ):
         self._hass = hass
         self._entry_id = entry_id
         self._name = name
         self._unit = unit
-        self._getter = getter
+        self._read_key = read_key
         self._setter = setter
         self._attr_native_step = step
         self._attr_native_min_value = min_v
@@ -110,14 +122,15 @@ class SettingNumber(NumberEntity):
 
     @property
     def native_value(self) -> Optional[float]:
-        c = self._collector
-        val = None
+        if self._read_key is None:
+            return self._last_set
+        val = _get_status_value(self._hass, self._entry_id, self._read_key)
+        if val is None:
+            return self._last_set
         try:
-            if c:
-                val = self._getter(c)
+            return float(val)
         except Exception:  # noqa: BLE001
-            val = None
-        return val if val is not None else self._last_set
+            return val
 
     async def async_set_native_value(self, value: float) -> None:
         c = self._collector

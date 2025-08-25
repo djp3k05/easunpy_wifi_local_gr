@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import timedelta
-from typing import Optional
+from typing import Any, Iterable, Optional
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
@@ -11,7 +11,6 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send, async_dispat
 from homeassistant.helpers.event import async_track_time_interval
 
 from easunpy.async_isolar import AsyncISolar
-from easunpy.models import BatteryData, GridData, OutputData, PVData, SystemStatus
 
 from .const import (
     DOMAIN,
@@ -26,6 +25,38 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
+# ---- small utils to read from dataclass OR dict ----
+def _get(obj: Any, keys: Iterable[str]) -> Any:
+    """Return first non-None value among attribute-or-key candidates."""
+    if obj is None:
+        return None
+    for k in keys:
+        # attribute
+        if hasattr(obj, k):
+            v = getattr(obj, k)
+            if v is not None:
+                return v
+        # dict key
+        if isinstance(obj, dict) and k in obj:
+            v = obj[k]
+            if v is not None:
+                return v
+    return None
+
+
+class FG:
+    """Field getter callable used by sensors."""
+    __slots__ = ("src_attr", "keys")
+
+    def __init__(self, src_attr: str, *keys: str):
+        self.src_attr = src_attr
+        self.keys = keys
+
+    def __call__(self, collector: "DataCollector"):
+        obj = getattr(collector, self.src_attr, None)
+        return _get(obj, self.keys)
+
+
 class DataCollector:
     """Owns the AsyncISolar client and caches the last reading for other platforms."""
 
@@ -34,11 +65,12 @@ class DataCollector:
         self.isolar = AsyncISolar(inverter_ip, local_ip, model=model)
         self.scan_interval = max(2, int(scan_interval or DEFAULT_SCAN_INTERVAL))
 
-        self.last_battery: Optional[BatteryData] = None
-        self.last_pv: Optional[PVData] = None
-        self.last_grid: Optional[GridData] = None
-        self.last_output: Optional[OutputData] = None
-        self.last_status: Optional[SystemStatus] = None
+        # These can be dataclasses OR dicts depending on easunpy version
+        self.last_battery: Optional[Any] = None
+        self.last_pv: Optional[Any] = None
+        self.last_grid: Optional[Any] = None
+        self.last_output: Optional[Any] = None
+        self.last_status: Optional[Any] = None
 
         self._task_unsub = None
         self._updating = False
@@ -67,11 +99,16 @@ class DataCollector:
         try:
             batt, pv, grid, out, status = await self.isolar.get_all_data()
             if any(x is not None for x in (batt, pv, grid, out, status)):
-                self.last_battery = batt or self.last_battery
-                self.last_pv = pv or self.last_pv
-                self.last_grid = grid or self.last_grid
-                self.last_output = out or self.last_output
-                self.last_status = status or self.last_status
+                if batt is not None:
+                    self.last_battery = batt
+                if pv is not None:
+                    self.last_pv = pv
+                if grid is not None:
+                    self.last_grid = grid
+                if out is not None:
+                    self.last_output = out
+                if status is not None:
+                    self.last_status = status
                 async_dispatcher_send(self.hass, SIGNAL_COLLECTOR_UPDATED)
                 _LOGGER.debug("Updated all registered sensors")
         except Exception as exc:  # noqa: BLE001
@@ -90,7 +127,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     local_ip = entry.data[CONF_LOCAL_IP]
     model = entry.data.get(CONF_MODEL, "VOLTRONIC_ASCII")
 
-    # Make one collector per entry and share it with other platforms
     group = hass.data.setdefault(DOMAIN, {})
     collector: DataCollector = group.get(entry.entry_id)
     if collector is None:
@@ -101,99 +137,98 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
     entities: list[SensorEntity] = []
 
-    def add(name: str, icon: str, unit: Optional[str], value_fn):
-        entities.append(GenericSensor(collector, name, icon, unit, value_fn))
+    def add(name: str, icon: str, unit: Optional[str], getter: FG):
+        entities.append(GenericSensor(collector, name, icon, unit, getter))
 
     # Battery
-    add("Battery Voltage", "mdi:car-battery", "V", lambda c: getattr(c.last_battery, "voltage", None))
-    add("Battery Current", "mdi:current-dc", "A", lambda c: getattr(c.last_battery, "current", None))
-    add("Battery Power", "mdi:flash", "W", lambda c: getattr(c.last_battery, "power", None))
-    add("Battery SoC", "mdi:battery-high", "%", lambda c: getattr(c.last_battery, "soc", None))
-    add("Inverter Temperature", "mdi:thermometer", "°C", lambda c: getattr(c.last_battery, "temperature", None))
-    add("Battery Charge Current", "mdi:current-dc", "A", lambda c: getattr(c.last_battery, "charge_current", None))
-    add("Battery Discharge Current", "mdi:current-dc", "A", lambda c: getattr(c.last_battery, "discharge_current", None))
-    add("Battery Voltage (SCC)", "mdi:car-battery", "V", lambda c: getattr(c.last_battery, "voltage_scc", None))
-    add("Battery Voltage Offset for Fans", "mdi:fan", None, lambda c: getattr(c.last_battery, "voltage_offset_for_fans", None))
-    add("EEPROM Version", "mdi:chip", None, lambda c: getattr(c.last_battery, "eeprom_version", None))
+    add("Battery Voltage", "mdi:car-battery", "V", FG("last_battery", "voltage", "battery_voltage"))
+    add("Battery Current", "mdi:current-dc", "A", FG("last_battery", "current", "battery_current"))
+    add("Battery Power", "mdi:flash", "W", FG("last_battery", "power", "battery_power"))
+    add("Battery SoC", "mdi:battery-high", "%", FG("last_battery", "soc", "battery_capacity", "battery_soc"))
+    add("Inverter Temperature", "mdi:thermometer", "°C", FG("last_battery", "temperature", "inverter_temperature"))
+    add("Battery Charge Current", "mdi:current-dc", "A", FG("last_battery", "charge_current", "battery_charging_current"))
+    add("Battery Discharge Current", "mdi:current-dc", "A", FG("last_battery", "discharge_current", "battery_discharge_current"))
+    add("Battery Voltage (SCC)", "mdi:car-battery", "V", FG("last_battery", "voltage_scc", "battery_voltage_from_scc"))
+    add("Battery Voltage Offset for Fans", "mdi:fan", None, FG("last_battery", "voltage_offset_for_fans"))
+    add("EEPROM Version", "mdi:chip", None, FG("last_battery", "eeprom_version"))
 
     # PV
-    add("PV Total Power", "mdi:solar-power", "W", lambda c: getattr(c.last_pv, "total_power", None))
-    add("PV Charging Power", "mdi:solar-power", "W", lambda c: getattr(c.last_pv, "charging_power", None))
-    add("PV Charging Current", "mdi:current-dc", "A", lambda c: getattr(c.last_pv, "charging_current", None))
-    add("PV1 Voltage", "mdi:solar-panel", "V", lambda c: getattr(c.last_pv, "pv1_voltage", None))
-    add("PV1 Current", "mdi:current-dc", "A", lambda c: getattr(c.last_pv, "pv1_current", None))
-    add("PV1 Power", "mdi:solar-power", "W", lambda c: getattr(c.last_pv, "pv1_power", None))
-    add("PV2 Voltage", "mdi:solar-panel", "V", lambda c: getattr(c.last_pv, "pv2_voltage", None))
-    add("PV2 Current", "mdi:current-dc", "A", lambda c: getattr(c.last_pv, "pv2_current", None))
-    add("PV2 Power", "mdi:solar-power", "W", lambda c: getattr(c.last_pv, "pv2_power", None))
-    add("PV Generated Today", "mdi:counter", None, lambda c: getattr(c.last_pv, "pv_generated_today", None))
-    add("PV Generated Total", "mdi:counter", None, lambda c: getattr(c.last_pv, "pv_generated_total", None))
+    add("PV Total Power", "mdi:solar-power", "W", FG("last_pv", "total_power", "pv_total_power"))
+    add("PV Charging Power", "mdi:solar-power", "W", FG("last_pv", "charging_power", "pv_charging_power"))
+    add("PV Charging Current", "mdi:current-dc", "A", FG("last_pv", "charging_current", "pv_charging_current"))
+    add("PV1 Voltage", "mdi:solar-panel", "V", FG("last_pv", "pv1_voltage"))
+    add("PV1 Current", "mdi:current-dc", "A", FG("last_pv", "pv1_current"))
+    add("PV1 Power", "mdi:solar-power", "W", FG("last_pv", "pv1_power"))
+    add("PV2 Voltage", "mdi:solar-panel", "V", FG("last_pv", "pv2_voltage"))
+    add("PV2 Current", "mdi:current-dc", "A", FG("last_pv", "pv2_current"))
+    add("PV2 Power", "mdi:solar-power", "W", FG("last_pv", "pv2_power"))
+    add("PV Generated Today", "mdi:counter", None, FG("last_pv", "pv_generated_today", "pv_today"))
+    add("PV Generated Total", "mdi:counter", None, FG("last_pv", "pv_generated_total", "pv_total"))
 
     # Grid
-    add("Grid Voltage", "mdi:transmission-tower", "V", lambda c: getattr(c.last_grid, "voltage", None))
-    add("Grid Power", "mdi:flash", "W", lambda c: getattr(c.last_grid, "power", None))
-    add("Grid Frequency", "mdi:sine-wave", "Hz", lambda c: getattr(c.last_grid, "frequency", None))
+    add("Grid Voltage", "mdi:transmission-tower", "V", FG("last_grid", "voltage", "grid_voltage"))
+    add("Grid Power", "mdi:flash", "W", FG("last_grid", "power", "grid_power"))
+    add("Grid Frequency", "mdi:sine-wave", "Hz", FG("last_grid", "frequency", "grid_frequency"))
 
     # Output
-    add("Output Voltage", "mdi:power-socket-eu", "V", lambda c: getattr(c.last_output, "voltage", None))
-    add("Output Current", "mdi:current-ac", "A", lambda c: getattr(c.last_output, "current", None))
-    add("Output Power", "mdi:flash", "W", lambda c: getattr(c.last_output, "power", None))
-    add("Output Apparent Power", "mdi:flash", "VA", lambda c: getattr(c.last_output, "apparent_power", None))
-    add("Output Load Percentage", "mdi:percent", "%", lambda c: getattr(c.last_output, "load_percentage", None))
-    add("Output Frequency", "mdi:sine-wave", "Hz", lambda c: getattr(c.last_output, "frequency", None))
+    add("Output Voltage", "mdi:power-socket-eu", "V", FG("last_output", "voltage", "ac_output_voltage", "output_voltage"))
+    add("Output Current", "mdi:current-ac", "A", FG("last_output", "current", "output_current"))
+    add("Output Power", "mdi:flash", "W", FG("last_output", "power", "ac_output_active_power", "output_active_power"))
+    add("Output Apparent Power", "mdi:flash", "VA", FG("last_output", "apparent_power", "ac_output_apparent_power", "output_apparent_power"))
+    add("Output Load Percentage", "mdi:percent", "%", FG("last_output", "load_percentage", "output_load_percent"))
+    add("Output Frequency", "mdi:sine-wave", "Hz", FG("last_output", "frequency", "ac_output_frequency", "output_frequency"))
 
-    # System status + QPIRI (to back-fill control defaults)
-    add("Operating Mode", "mdi:power-settings", None, lambda c: getattr(c.last_status, "mode_name", None))
-    add("Inverter Time", "mdi:clock-outline", None, lambda c: getattr(c.last_status, "inverter_time", None))
-    add("Bus Voltage", "mdi:resistor", "V", lambda c: getattr(c.last_status, "bus_voltage", None))
-    add("Device Status Flags", "mdi:flag-outline", None, lambda c: getattr(c.last_status, "device_status_flags", None))
-    add("Device Status 2 Flags", "mdi:flag-outline", None, lambda c: getattr(c.last_status, "device_status_flags2", None))
-    add("Warnings", "mdi:alert-outline", None, lambda c: getattr(c.last_status, "warnings", None))
+    # System status + QPIRI (settings snapshot)
+    add("Operating Mode", "mdi:power-settings", None, FG("last_status", "mode_name", "operating_mode"))
+    add("Inverter Time", "mdi:clock-outline", None, FG("last_status", "inverter_time"))
+    add("Bus Voltage", "mdi:resistor", "V", FG("last_status", "bus_voltage"))
+    add("Device Status Flags", "mdi:flag-outline", None, FG("last_status", "device_status_flags"))
+    add("Device Status 2 Flags", "mdi:flag-outline", None, FG("last_status", "device_status_flags2"))
+    add("Warnings", "mdi:alert-outline", None, FG("last_status", "warnings"))
 
-    add("Grid Rating Voltage", "mdi:alpha-g-circle", "V", lambda c: getattr(c.last_status, "grid_rating_voltage", None))
-    add("Grid Rating Current", "mdi:alpha-g-circle", "A", lambda c: getattr(c.last_status, "grid_rating_current", None))
-    add("AC Output Rating Voltage", "mdi:alpha-a-circle", "V", lambda c: getattr(c.last_status, "ac_output_rating_voltage", None))
-    add("AC Output Rating Frequency", "mdi:alpha-a-circle", "Hz", lambda c: getattr(c.last_status, "ac_output_rating_frequency", None))
-    add("AC Output Rating Current", "mdi:alpha-a-circle", "A", lambda c: getattr(c.last_status, "ac_output_rating_current", None))
-    add("AC Output Rating Apparent Power", "mdi:alpha-a-circle", "VA", lambda c: getattr(c.last_status, "ac_output_rating_apparent_power", None))
-    add("AC Output Rating Active Power", "mdi:alpha-a-circle", "W", lambda c: getattr(c.last_status, "ac_output_rating_active_power", None))
-    add("Battery Rating Voltage", "mdi:alpha-b-circle", "V", lambda c: getattr(c.last_status, "battery_rating_voltage", None))
-    add("Battery Re-Charge Voltage", "mdi:alpha-b-circle", "V", lambda c: getattr(c.last_status, "battery_recharge_voltage", None))
-    add("Battery Under Voltage", "mdi:alpha-b-circle", "V", lambda c: getattr(c.last_status, "battery_undervoltage", None))
-    add("Battery Bulk Voltage", "mdi:alpha-b-circle", "V", lambda c: getattr(c.last_status, "battery_bulk_voltage", None))
-    add("Battery Float Voltage", "mdi:alpha-b-circle", "V", lambda c: getattr(c.last_status, "battery_float_voltage", None))
-    add("Battery Type", "mdi:car-battery", None, lambda c: getattr(c.last_status, "battery_type", None))
-    add("Max AC Charging Current", "mdi:alpha-m-circle", "A", lambda c: getattr(c.last_status, "max_ac_charging_current", None))
-    add("Max Charging Current", "mdi:alpha-m-circle", "A", lambda c: getattr(c.last_status, "max_charging_current", None))
-    add("Input Voltage Range", "mdi:alpha-i-circle", None, lambda c: getattr(c.last_status, "input_voltage_range", None))
-    add("Output Source Priority", "mdi:alpha-o-circle", None, lambda c: getattr(c.last_status, "output_source_priority", None))
-    add("Charger Source Priority", "mdi:alpha-c-circle", None, lambda c: getattr(c.last_status, "charger_source_priority", None))
-    add("Parallel Max Num", "mdi:alpha-p-circle", None, lambda c: getattr(c.last_status, "parallel_max_num", None))
-    add("Machine Type", "mdi:cog", None, lambda c: getattr(c.last_status, "machine_type", None))
-    add("Topology", "mdi:vector-triangle", None, lambda c: getattr(c.last_status, "topology", None))
-    add("Output Mode (QPIRI)", "mdi:alpha-o-circle", None, lambda c: getattr(c.last_status, "output_mode_qpiri", None))
-    add("Battery Re-Discharge Voltage", "mdi:alpha-b-circle", "V", lambda c: getattr(c.last_status, "battery_redischarge_voltage", None))
-    add("PV OK Condition", "mdi:solar-power", None, lambda c: getattr(c.last_status, "pv_ok_condition", None))
-    add("PV Power Balance", "mdi:solar-power", None, lambda c: getattr(c.last_status, "pv_power_balance", None))
-    add("Max Charging Time at CV", "mdi:timer", "min", lambda c: getattr(c.last_status, "max_charging_time_cv", None))
-    add("Max Discharging Current", "mdi:current-dc", "A", lambda c: getattr(c.last_status, "max_discharging_current", None))
+    add("Grid Rating Voltage", "mdi:alpha-g-circle", "V", FG("last_status", "grid_rating_voltage"))
+    add("Grid Rating Current", "mdi:alpha-g-circle", "A", FG("last_status", "grid_rating_current"))
+    add("AC Output Rating Voltage", "mdi:alpha-a-circle", "V", FG("last_status", "ac_output_rating_voltage"))
+    add("AC Output Rating Frequency", "mdi:alpha-a-circle", "Hz", FG("last_status", "ac_output_rating_frequency"))
+    add("AC Output Rating Current", "mdi:alpha-a-circle", "A", FG("last_status", "ac_output_rating_current"))
+    add("AC Output Rating Apparent Power", "mdi:alpha-a-circle", "VA", FG("last_status", "ac_output_rating_apparent_power"))
+    add("AC Output Rating Active Power", "mdi:alpha-a-circle", "W", FG("last_status", "ac_output_rating_active_power"))
+    add("Battery Rating Voltage", "mdi:alpha-b-circle", "V", FG("last_status", "battery_rating_voltage"))
+    add("Battery Re-Charge Voltage", "mdi:alpha-b-circle", "V", FG("last_status", "battery_recharge_voltage"))
+    add("Battery Under Voltage", "mdi:alpha-b-circle", "V", FG("last_status", "battery_undervoltage"))
+    add("Battery Bulk Voltage", "mdi:alpha-b-circle", "V", FG("last_status", "battery_bulk_voltage"))
+    add("Battery Float Voltage", "mdi:alpha-b-circle", "V", FG("last_status", "battery_float_voltage"))
+    add("Battery Type", "mdi:car-battery", None, FG("last_status", "battery_type"))
+    add("Max AC Charging Current", "mdi:alpha-m-circle", "A", FG("last_status", "max_ac_charging_current"))
+    add("Max Charging Current", "mdi:alpha-m-circle", "A", FG("last_status", "max_charging_current"))
+    add("Input Voltage Range", "mdi:alpha-i-circle", None, FG("last_status", "input_voltage_range"))
+    add("Output Source Priority", "mdi:alpha-o-circle", None, FG("last_status", "output_source_priority"))
+    add("Charger Source Priority", "mdi:alpha-c-circle", None, FG("last_status", "charger_source_priority"))
+    add("Parallel Max Num", "mdi:alpha-p-circle", None, FG("last_status", "parallel_max_num"))
+    add("Machine Type", "mdi:cog", None, FG("last_status", "machine_type"))
+    add("Topology", "mdi:vector-triangle", None, FG("last_status", "topology"))
+    add("Output Mode (QPIRI)", "mdi:alpha-o-circle", None, FG("last_status", "output_mode_qpiri"))
+    add("Battery Re-Discharge Voltage", "mdi:alpha-b-circle", "V", FG("last_status", "battery_redischarge_voltage"))
+    add("PV OK Condition", "mdi:solar-power", None, FG("last_status", "pv_ok_condition"))
+    add("PV Power Balance", "mdi:solar-power", None, FG("last_status", "pv_power_balance"))
+    add("Max Charging Time at CV", "mdi:timer", "min", FG("last_status", "max_charging_time_cv"))
+    add("Max Discharging Current", "mdi:current-dc", "A", FG("last_status", "max_discharging_current"))
 
-    # Register entities
     async_add_entities(entities)
 
-    # 🔑 Force one immediate refresh AFTER entities are added so they get their first state
+    # Force one immediate refresh AFTER entities are added so they get their first state
     await collector.async_poll_once()
 
 
 class GenericSensor(SensorEntity):
     _attr_should_poll = False
 
-    def __init__(self, collector: DataCollector, name: str, icon: str, unit: str | None, value_fn):
+    def __init__(self, collector: DataCollector, name: str, icon: str, unit: str | None, getter: FG):
         self._collector = collector
         self._name = name
         self._icon = icon
         self._unit = unit
-        self._value_fn = value_fn
+        self._getter = getter
         self._unsub = None
 
     @property
@@ -211,7 +246,7 @@ class GenericSensor(SensorEntity):
     @property
     def native_value(self):
         try:
-            return self._value_fn(self._collector)
+            return self._getter(self._collector)
         except Exception:  # noqa: BLE001
             return None
 
@@ -219,7 +254,6 @@ class GenericSensor(SensorEntity):
         @callback
         def _updated():
             self.async_write_ha_state()
-        # Subscribe to collector refreshes
         self._unsub = async_dispatcher_connect(self.hass, SIGNAL_COLLECTOR_UPDATED, _updated)
 
     async def async_will_remove_from_hass(self) -> None:

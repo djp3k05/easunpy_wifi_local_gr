@@ -27,6 +27,22 @@ OUTPUT_MODE_OPTIONS = [
 ]
 
 
+def _get_status_value(hass: HomeAssistant, entry_id: str, *keys: str) -> Optional[str]:
+    c = hass.data.get(DOMAIN, {}).get(entry_id)
+    status = getattr(c, "last_status", None) if c else None
+    if status is None:
+        return None
+    # support dataclass or dict
+    for k in keys:
+        if hasattr(status, k):
+            v = getattr(status, k)
+            if v is not None:
+                return v
+        if isinstance(status, dict) and k in status and status[k] is not None:
+            return status[k]
+    return None
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities) -> None:
     entities: list[SelectEntity] = [
         OutputSourcePrioritySelect(hass, entry.entry_id),
@@ -48,7 +64,6 @@ class _BaseSelect(SelectEntity):
 
     @property
     def _collector(self):
-        # Lazy lookup avoids race with sensor.py collector creation
         return self._hass.data.get(DOMAIN, {}).get(self._entry_id)
 
     async def async_added_to_hass(self) -> None:
@@ -74,9 +89,7 @@ class OutputSourcePrioritySelect(_BaseSelect):
 
     @property
     def current_option(self) -> Optional[str]:
-        c = self._collector
-        status = getattr(c, "last_status", None) if c else None
-        return getattr(status, "output_source_priority", None) if status else None
+        return _get_status_value(self.hass, self._entry_id, "output_source_priority")
 
     async def async_select_option(self, option: str) -> None:
         c = self._collector
@@ -98,9 +111,7 @@ class ChargerSourcePrioritySelect(_BaseSelect):
 
     @property
     def current_option(self) -> Optional[str]:
-        c = self._collector
-        status = getattr(c, "last_status", None) if c else None
-        return getattr(status, "charger_source_priority", None) if status else None
+        return _get_status_value(self.hass, self._entry_id, "charger_source_priority")
 
     async def async_select_option(self, option: str) -> None:
         c = self._collector
@@ -122,9 +133,7 @@ class InputVoltageRangeSelect(_BaseSelect):
 
     @property
     def current_option(self) -> Optional[str]:
-        c = self._collector
-        status = getattr(c, "last_status", None) if c else None
-        return getattr(status, "input_voltage_range", None) if status else None
+        return _get_status_value(self.hass, self._entry_id, "input_voltage_range")
 
     async def async_select_option(self, option: str) -> None:
         c = self._collector
@@ -146,9 +155,7 @@ class OutputModeSelect(_BaseSelect):
 
     @property
     def current_option(self) -> Optional[str]:
-        c = self._collector
-        status = getattr(c, "last_status", None) if c else None
-        return getattr(status, "output_mode_qpiri", None) if status else None
+        return _get_status_value(self.hass, self._entry_id, "output_mode_qpiri")
 
     async def async_select_option(self, option: str) -> None:
         c = self._collector
