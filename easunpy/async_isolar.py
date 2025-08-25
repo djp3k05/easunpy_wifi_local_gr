@@ -8,6 +8,9 @@ Async high-level API for Easun/Voltronic inverters.
 - Keeps the working ASCII read path (QPIGS/QPIGS2/QMOD/QPIWS/QPIRI).
 - Adds write (settings) helpers that send one-off ASCII commands and
   check for (ACK)/(NAK).
+- IMPORTANT: When the TCP client is not connected yet, polls now return
+  (None, None, None, None, None) instead of raising, so the update loop
+  doesn’t record failures just for no-connection.
 
 This file depends on:
 - easunpy.async_modbusclient.AsyncModbusClient  (server/tunnel transport)
@@ -22,8 +25,6 @@ from typing import Optional, Dict, Tuple, Any, List
 
 from .async_modbusclient import AsyncModbusClient
 from .modbusclient import (
-    create_request,
-    decode_modbus_response,
     create_ascii_request,
     decode_ascii_response,
 )
@@ -38,7 +39,7 @@ from .models import (
     OperatingMode,
 )
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = logging.getLogger("easunpy.async_isolar")
 
 
 class AsyncISolar:
@@ -62,7 +63,7 @@ class AsyncISolar:
         return tid
 
     # ---------------------------------------------------------------------
-    # READ PATH (unchanged in spirit; parses QPIGS/QPIGS2/QMOD/QPIWS/QPIRI)
+    # READ PATH (QPIGS/QPIGS2/QMOD/QPIWS/QPIRI) with graceful no-connection
     # ---------------------------------------------------------------------
 
     async def _get_all_data_ascii(
@@ -77,18 +78,24 @@ class AsyncISolar:
         """Fetch and parse QPIGS/QPIGS2/QMOD/QPIWS/QPIRI ASCII data."""
         commands = ["QPIGS", "QPIGS2", "QMOD", "QPIWS", "QPIRI"]
         requests = [create_ascii_request(self._get_next_transaction_id(), 0x0001, cmd) for cmd in commands]
+
         responses = await self.client.send_bulk(requests)
-        if not responses or len(responses) < len(commands):
-            raise ValueError("Failed to get ASCII responses")
+        # If listener is up but inverter not connected yet, send_bulk returns [None, ...].
+        if not responses or all(r is None for r in responses):
+            _LOGGER.debug("No ASCII responses (likely not connected); skipping parse")
+            return None, None, None, None, None
 
-        raw_qpigs = decode_ascii_response(responses[0])
-        raw_qpigs2 = decode_ascii_response(responses[1])
-        raw_qmod = decode_ascii_response(responses[2])
-        raw_qpiws = decode_ascii_response(responses[3])
-        raw_qpiri = decode_ascii_response(responses[4])
+        # Decode (each decode returns a raw "(...)" string or None)
+        raw_qpigs = decode_ascii_response(responses[0]) if responses[0] else None
+        raw_qpigs2 = decode_ascii_response(responses[1]) if responses[1] else None
+        raw_qmod = decode_ascii_response(responses[2]) if responses[2] else None
+        raw_qpiws = decode_ascii_response(responses[3]) if responses[3] else None
+        raw_qpiri = decode_ascii_response(responses[4]) if responses[4] else None
 
+        # If the inverter sent nothing useful yet, skip gracefully.
         if not raw_qpigs or not raw_qmod:
-            raise ValueError("Invalid ASCII responses")
+            _LOGGER.debug("ASCII responses incomplete (no QPIGS/QMOD); skipping parse")
+            return None, None, None, None, None
 
         qpigs = raw_qpigs.lstrip("(").split()
         qpigs2 = raw_qpigs2.lstrip("(").split() if raw_qpigs2 else []
@@ -97,7 +104,8 @@ class AsyncISolar:
         qmod = raw_qmod.lstrip("(").strip()
 
         if len(qpigs) < 21:
-            raise ValueError("Unexpected QPIGS format")
+            _LOGGER.debug("Unexpected QPIGS format; skipping parse")
+            return None, None, None, None, None
 
         vals: Dict[str, Any] = {}
 
@@ -275,7 +283,7 @@ class AsyncISolar:
         Optional[SystemStatus],
     ]:
         """Fetch all data for current model."""
-        # For your case (VOLTRONIC_ASCII), we only use the ASCII branch.
+        # For VOLTRONIC_ASCII we only use ASCII branch.
         return await self._get_all_data_ascii()
 
     # ------------------ Helpers for parsing ------------------
@@ -531,9 +539,6 @@ class AsyncISolar:
         return await self.apply_setting(f"PCVT{m:03d}")
 
     async def set_datetime(self) -> bool:
-        # Use inverter 'DAT' with host time is handled by your button via apply_setting(DAT..)
-        # Here we simply issue DAT<YYMMDDHHMMSS> based on Python time format on the inverter side,
-        # but keeping this simple we rely on the button service to call DAT now. If needed, add a full formatter.
         from datetime import datetime
         return await self.apply_setting(datetime.now().strftime("DAT%y%m%d%H%M%S"))
 
@@ -586,9 +591,3 @@ class AsyncISolar:
         if not (30 <= a <= 150):
             raise ValueError("Max discharge current must be 30..150 A (or 0 to disable)")
         return await self.apply_setting(f"PBATMAXDISC{a:03d}")
-
-    async def flag_set(self, flag: str, enable: bool) -> bool:
-        flag = flag.upper().strip()
-        if flag not in ("A", "B", "K", "U", "V", "X", "Y", "Z"):
-            raise ValueError("Unknown flag (use one of A,B,K,U,V,X,Y,Z)")
-        return await self.apply_setting(("PE" if enable else "PD") + flag)
