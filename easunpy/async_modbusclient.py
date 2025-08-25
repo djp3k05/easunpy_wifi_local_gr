@@ -3,9 +3,10 @@ easunpy.async_modbusclient
 --------------------------
 TCP "cloud-server" shim for Voltronic/PI18 ASCII via the FF 04 wrapper.
 
-- Keeps the existing bulk send path used by sensor polling (send_bulk).
-- Adds send_ascii_command() for one-off write commands.
-- Compatible with previous logs/behavior ("Reusing existing TCP connection", etc.).
+This version keeps the listener PERSISTENT:
+- We no longer stop() the server on connection timeouts during updates.
+- The server stays up so the inverter can connect whenever it's ready.
+- Default connect timeout increased to 60s.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ _LOGGER = logging.getLogger("easunpy.async_modbusclient")
 class AsyncModbusClient:
     """Listens on TCP and speaks the FF 04 tunnel with the inverter (server mode)."""
 
-    def __init__(self, inverter_ip: str, local_ip: str, port: int = 502, connect_timeout: float = 10.0):
+    def __init__(self, inverter_ip: str, local_ip: str, port: int = 502, connect_timeout: float = 60.0):
         # inverter_ip is not used in server mode but kept for compatibility/diagnostics
         self._inverter_ip = inverter_ip
         self._local_ip = local_ip
@@ -47,6 +48,11 @@ class AsyncModbusClient:
                 pass
         self._reader = reader
         self._writer = writer
+        peer = writer.get_extra_info("peername")
+        if peer:
+            _LOGGER.info("Inverter connected from %s:%s", peer[0], peer[1])
+        else:
+            _LOGGER.info("Inverter connected")
         self._client_ready.set()
 
     async def start(self) -> None:
@@ -61,17 +67,22 @@ class AsyncModbusClient:
             raise
 
     async def _ensure_client(self) -> None:
-        """Wait for inverter connection (with timeout)."""
+        """
+        Ensure the listener is up and (if we don't already have a client) wait a bit
+        for the inverter to connect. We DO NOT stop() the server on timeout anymore.
+        """
         if self._server is None:
             await self.start()
+
         if self._reader and self._writer and not self._writer.is_closing():
             _LOGGER.debug("Reusing existing TCP connection")
             return
+
         try:
             await asyncio.wait_for(self._client_ready.wait(), timeout=self._connect_timeout)
         except asyncio.TimeoutError:
             _LOGGER.warning("Timeout waiting for client connection")
-            await self.stop()
+            # Important: do NOT stop the server here; keep listening persistently.
             raise
 
     async def stop(self) -> None:
@@ -101,8 +112,8 @@ class AsyncModbusClient:
 
     async def send_bulk(self, requests: List[bytes], timeout: float = 5.0) -> List[Optional[bytes]]:
         """
-        Send multiple Modbus/TCP-like requests (FF 04 tunnel) and collect replies.
-        Each request already includes header+payload (built by modbusclient.create_* helpers).
+        Send multiple FF 04 requests and collect replies.
+        Each request already includes header+payload (built by modbusclient helpers).
         """
         if not requests:
             return []
@@ -123,11 +134,11 @@ class AsyncModbusClient:
                     _LOGGER.debug("Response: %s", resp.hex())
                     results.append(resp)
                 except asyncio.TimeoutError:
-                    _LOGGER.warning("Timeout waiting for client connection")
+                    _LOGGER.warning("No response for a command (read timeout)")
                     results.append(None)
                 except Exception as exc:
                     _LOGGER.error("Transport error: %s", exc, exc_info=False)
-                    await self.stop()
+                    # Do NOT stop the server here; keep it up for the next cycle.
                     results.append(None)
             return results
 
@@ -135,7 +146,7 @@ class AsyncModbusClient:
         """
         Send a *single* prebuilt ASCII packet (full FF 04 wrapper already built)
         and return the full raw response bytes (header+payload), or None on error.
-        This is used by the settings API for one-off commands.
+        Used by the settings API for one-off commands.
         """
         async with self._lock:
             await self._ensure_client()
@@ -151,9 +162,9 @@ class AsyncModbusClient:
                 _LOGGER.debug("Response: %s", resp.hex())
                 return resp
             except asyncio.TimeoutError:
-                _LOGGER.warning("No response for settings command")
+                _LOGGER.warning("No response for settings command (read timeout)")
                 return None
             except Exception as exc:
                 _LOGGER.error("Transport error on settings command: %s", exc, exc_info=False)
-                await self.stop()
+                # Keep server up for the next attempt.
                 return None
