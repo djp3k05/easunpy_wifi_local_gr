@@ -3,10 +3,10 @@ easunpy.async_modbusclient
 --------------------------
 TCP "cloud-server" shim for Voltronic/PI18 ASCII via the FF 04 wrapper.
 
-This version keeps the listener PERSISTENT:
-- We no longer stop() the server on connection timeouts during updates.
+This version keeps the listener PERSISTENT and NON-BLOCKING for polls:
 - The server stays up so the inverter can connect whenever it's ready.
-- Default connect timeout increased to 60s.
+- Polls do NOT block waiting for a connection; if not connected yet,
+  we return immediately and try again next cycle.
 """
 
 from __future__ import annotations
@@ -23,7 +23,13 @@ _LOGGER = logging.getLogger("easunpy.async_modbusclient")
 class AsyncModbusClient:
     """Listens on TCP and speaks the FF 04 tunnel with the inverter (server mode)."""
 
-    def __init__(self, inverter_ip: str, local_ip: str, port: int = 502, connect_timeout: float = 60.0):
+    def __init__(
+        self,
+        inverter_ip: str,
+        local_ip: str,
+        port: int = 502,
+        connect_timeout: float = 60.0,  # kept for compatibility; we no longer block on it during polls
+    ):
         # inverter_ip is not used in server mode but kept for compatibility/diagnostics
         self._inverter_ip = inverter_ip
         self._local_ip = local_ip
@@ -37,6 +43,8 @@ class AsyncModbusClient:
         self._client_ready = asyncio.Event()
         self._lock = asyncio.Lock()
         self._trans_id = int(time.time()) & 0xFFFF
+
+    # ---------------- Core server lifecycle ----------------
 
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         # Accept newest client; close old writer if needed
@@ -66,24 +74,14 @@ class AsyncModbusClient:
             _LOGGER.error("Failed to start TCP server: %s", exc, exc_info=False)
             raise
 
-    async def _ensure_client(self) -> None:
-        """
-        Ensure the listener is up and (if we don't already have a client) wait a bit
-        for the inverter to connect. We DO NOT stop() the server on timeout anymore.
-        """
+    async def ensure_listening(self) -> None:
+        """Ensure the listener is up; do not wait for a client connection here."""
         if self._server is None:
             await self.start()
 
-        if self._reader and self._writer and not self._writer.is_closing():
-            _LOGGER.debug("Reusing existing TCP connection")
-            return
-
-        try:
-            await asyncio.wait_for(self._client_ready.wait(), timeout=self._connect_timeout)
-        except asyncio.TimeoutError:
-            _LOGGER.warning("Timeout waiting for client connection")
-            # Important: do NOT stop the server here; keep listening persistently.
-            raise
+    def is_connected(self) -> bool:
+        """Return True if we currently have an active client connection."""
+        return bool(self._reader and self._writer and not self._writer.is_closing())
 
     async def stop(self) -> None:
         """Stop server and drop connection."""
@@ -110,15 +108,24 @@ class AsyncModbusClient:
         self._trans_id = (self._trans_id + 1) & 0xFFFF
         return self._trans_id
 
+    # ---------------- Request helpers ----------------
+
     async def send_bulk(self, requests: List[bytes], timeout: float = 5.0) -> List[Optional[bytes]]:
         """
         Send multiple FF 04 requests and collect replies.
         Each request already includes header+payload (built by modbusclient helpers).
+
+        If no inverter is connected yet, we return a list of None (non-blocking).
         """
         if not requests:
             return []
         async with self._lock:
-            await self._ensure_client()
+            # Make sure we're listening, but DO NOT block waiting for a client
+            await self.ensure_listening()
+            if not self.is_connected():
+                _LOGGER.debug("No inverter connection yet; skipping this cycle")
+                return [None for _ in requests]
+
             results: List[Optional[bytes]] = []
             assert self._reader and self._writer
             for req in requests:
@@ -138,7 +145,7 @@ class AsyncModbusClient:
                     results.append(None)
                 except Exception as exc:
                     _LOGGER.error("Transport error: %s", exc, exc_info=False)
-                    # Do NOT stop the server here; keep it up for the next cycle.
+                    # Keep server up for the next attempt.
                     results.append(None)
             return results
 
@@ -146,10 +153,14 @@ class AsyncModbusClient:
         """
         Send a *single* prebuilt ASCII packet (full FF 04 wrapper already built)
         and return the full raw response bytes (header+payload), or None on error.
-        Used by the settings API for one-off commands.
+
+        If no inverter is connected yet, return None immediately (non-blocking).
         """
         async with self._lock:
-            await self._ensure_client()
+            await self.ensure_listening()
+            if not self.is_connected():
+                _LOGGER.debug("No inverter connection yet; skipping settings command")
+                return None
             try:
                 assert self._reader and self._writer
                 _LOGGER.debug("Sending command: %s", ascii_command_packet.hex())
@@ -166,5 +177,4 @@ class AsyncModbusClient:
                 return None
             except Exception as exc:
                 _LOGGER.error("Transport error on settings command: %s", exc, exc_info=False)
-                # Keep server up for the next attempt.
                 return None
