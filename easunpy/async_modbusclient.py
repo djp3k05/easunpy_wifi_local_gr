@@ -6,10 +6,14 @@ TCP "cloud-server" shim for Voltronic/PI18 ASCII via the FF 04 wrapper.
 This version:
 - Starts the TCP listener EARLY and keeps it persistent.
 - Polls are NON-BLOCKING when no client is connected (we skip that cycle).
-- Restores the original UDP "poke" used by your dongle:
+- Restores the original UDP unicast "poke" your dongle expects:
     unicast to <inverter_ip>:58899 with payload
         b"set>server=<local_ip>:<port>;"
-  sent periodically until the inverter connects.
+  sent periodically.
+- ACCEPTS BOTH bytes AND str requests:
+    * bytes are sent as-is
+    * hex strings are converted with bytes.fromhex()
+    * any other str is encoded (latin-1 fallback)
 """
 
 from __future__ import annotations
@@ -19,9 +23,33 @@ import logging
 import socket
 import struct
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 _LOGGER = logging.getLogger("easunpy.async_modbusclient")
+
+
+def _to_bytes(req: Union[bytes, bytearray, memoryview, str, List[int], Tuple[int, ...]]) -> bytes:
+    """Coerce various request types into raw bytes."""
+    if isinstance(req, (bytes, bytearray, memoryview)):
+        return bytes(req)
+    if isinstance(req, str):
+        s = req.strip()
+        # Heuristic: hex string (even length, hex chars only)
+        if len(s) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in s):
+            try:
+                return bytes.fromhex(s)
+            except ValueError:
+                # Fall back to raw encoding
+                pass
+        try:
+            return s.encode("ascii")
+        except Exception:
+            return s.encode("latin-1", "ignore")
+    # Maybe an iterable of ints (0..255)
+    try:
+        return bytes(req)  # type: ignore[arg-type]
+    except Exception as exc:
+        raise TypeError(f"Unsupported request type for transport: {type(req)!r}") from exc
 
 
 class AsyncModbusClient:
@@ -226,10 +254,12 @@ class AsyncModbusClient:
 
     # ---------------- Request helpers (TCP) ----------------
 
-    async def send_bulk(self, requests: List[bytes], timeout: float = 5.0) -> List[Optional[bytes]]:
+    async def send_bulk(self, requests: List[Union[bytes, str]], timeout: float = 5.0) -> List[Optional[bytes]]:
         """
         Send multiple FF 04 requests and collect replies.
         Each request already includes header+payload (built by modbusclient helpers).
+
+        Accepts bytes or strings. If strings look like hex, we decode them first.
 
         If no inverter is connected yet, we return a list of None (non-blocking).
         """
@@ -246,8 +276,9 @@ class AsyncModbusClient:
             assert self._reader and self._writer
             for req in requests:
                 try:
-                    _LOGGER.debug("Sending command: %s", req.hex())
-                    self._writer.write(req)
+                    req_bytes = _to_bytes(req)
+                    _LOGGER.debug("Sending command: %s", req_bytes.hex())
+                    self._writer.write(req_bytes)
                     await self._writer.drain()
 
                     header = await asyncio.wait_for(self._reader.readexactly(6), timeout=timeout)
@@ -265,11 +296,12 @@ class AsyncModbusClient:
                     results.append(None)
             return results
 
-    async def send_ascii_command(self, ascii_command_packet: bytes, timeout: float = 5.0) -> Optional[bytes]:
+    async def send_ascii_command(self, ascii_command_packet: Union[bytes, str], timeout: float = 5.0) -> Optional[bytes]:
         """
         Send a *single* prebuilt ASCII packet (full FF 04 wrapper already built)
         and return the full raw response bytes (header+payload), or None on error.
 
+        Accepts bytes or strings (hex strings supported).
         If no inverter is connected yet, return None immediately (non-blocking).
         """
         async with self._lock:
@@ -278,9 +310,10 @@ class AsyncModbusClient:
                 _LOGGER.debug("No inverter connection yet; skipping settings command")
                 return None
             try:
+                req_bytes = _to_bytes(ascii_command_packet)
                 assert self._reader and self._writer
-                _LOGGER.debug("Sending command: %s", ascii_command_packet.hex())
-                self._writer.write(ascii_command_packet)
+                _LOGGER.debug("Sending command: %s", req_bytes.hex())
+                self._writer.write(req_bytes)
                 await self._writer.drain()
                 header = await asyncio.wait_for(self._reader.readexactly(6), timeout=timeout)
                 length = struct.unpack(">H", header[4:6])[0]
