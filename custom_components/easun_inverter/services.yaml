@@ -87,8 +87,10 @@ set_output_rated_frequency:
     hz:
       example: 50
       selector:
-        select:
-          options: [50, 60]
+        number:
+          min: 50
+          max: 60
+          step: 10
 
 set_max_charging_current:
   name: Set Max Charging Current
