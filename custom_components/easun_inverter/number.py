@@ -1,157 +1,240 @@
+# easun_inverter/number.py
+
+"""Number entities to change numeric inverter settings."""
 from __future__ import annotations
 
 import logging
-from typing import Optional, Callable
+from typing import Optional
 
 from homeassistant.components.number import NumberEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, SIGNAL_COLLECTOR_UPDATED
+from . import DOMAIN
+from .sensor import DataCollector
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def _get_status_value(hass: HomeAssistant, entry_id: str, *keys: str):
-    c = hass.data.get(DOMAIN, {}).get(entry_id)
-    status = getattr(c, "last_status", None) if c else None
-    if status is None:
-        return None
-    for k in keys:
-        if hasattr(status, k):
-            v = getattr(status, k)
-            if v is not None:
-                return v
-        if isinstance(status, dict) and k in status and status[k] is not None:
-            return status[k]
-    return None
-
-
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities) -> None:
-    entry_id = entry.entry_id
-
-    def N(
-        name: str,
-        unit: str,
-        native_step: float,
-        read_key: Optional[str],
-        setter: Callable,
-        min_v: float,
-        max_v: float,
-    ):
-        return SettingNumber(hass, entry_id, name, unit, native_step, read_key, setter, min_v, max_v)
-
-    entities = [
-        N("Battery Re-Charge Voltage", "V", 0.1, "battery_recharge_voltage",
-          lambda iso, v: iso.set_battery_recharge_voltage(v), 22.0, 62.0),
-
-        N("Battery Re-Discharge Voltage", "V", 0.1, "battery_redischarge_voltage",
-          lambda iso, v: iso.set_battery_redischarge_voltage(v), 0.0, 62.0),
-
-        N("Battery Cut-Off Voltage", "V", 0.1, None,
-          lambda iso, v: iso.set_battery_cutoff_voltage(v), 36.0, 48.0),
-
-        N("Battery Bulk/CV Voltage", "V", 0.1, "battery_bulk_voltage",
-          lambda iso, v: iso.set_battery_bulk_voltage(v), 24.0, 64.0),
-
-        N("Battery Float Voltage", "V", 0.1, "battery_float_voltage",
-          lambda iso, v: iso.set_battery_float_voltage(v), 24.0, 64.0),
-
-        N("Max Charging Time at CV", "min", 5, "max_charging_time_cv",
-          lambda iso, v: iso.set_cv_stage_max_time(int(v)), 0, 900),
-
-        N("Max Charging Current", "A", 1, "max_charging_current",
-          lambda iso, v: iso.set_max_charging_current(int(v)), 0, 150),
-
-        N("Max Utility Charging Current", "A", 1, "max_ac_charging_current",
-          lambda iso, v: iso.set_max_utility_charging_current(int(v)), 0, 30),
-
-        N("Max Discharging Current", "A", 1, "max_discharging_current",
-          lambda iso, v: iso.set_max_discharge_current(int(v)), 0, 150),
-
-        # Equalization values (usually not readable)
-        N("Equalization Time", "min", 5, None, lambda iso, v: iso.equalization_set_time(int(v)), 5, 900),
-        N("Equalization Period", "days", 1, None, lambda iso, v: iso.equalization_set_period(int(v)), 0, 90),
-        N("Equalization Voltage", "V", 0.01, None, lambda iso, v: iso.equalization_set_voltage(float(v)), 24.0, 64.0),
-        N("Equalization Over Time", "min", 5, None, lambda iso, v: iso.equalization_set_over_time(int(v)), 5, 900),
-    ]
-
-    async_add_entities(entities)
-    _LOGGER.debug("Number entities added")
-
-
-class SettingNumber(NumberEntity):
+class _BaseNumber(NumberEntity):
     _attr_should_poll = False
 
     def __init__(
         self,
-        hass: HomeAssistant,
-        entry_id: str,
+        coordinator: DataCollector,
         name: str,
-        unit: str,
+        system_key: str,
+        min_value: float,
+        max_value: float,
         step: float,
-        read_key: Optional[str],
-        setter: Callable,
-        min_v: float,
-        max_v: float,
+        unit: str | None,
     ):
-        self._hass = hass
-        self._entry_id = entry_id
-        self._name = name
-        self._unit = unit
-        self._read_key = read_key
-        self._setter = setter
+        self._coordinator = coordinator
+        self._attr_name = name
+        self._attr_unique_id = f"easun_number_{system_key}"
+        self._key = system_key
+        self._attr_native_min_value = min_value
+        self._attr_native_max_value = max_value
         self._attr_native_step = step
-        self._attr_native_min_value = min_v
-        self._attr_native_max_value = max_v
-        self._last_set: Optional[float] = None
-        self._unsub = None
+        self._attr_native_unit_of_measurement = unit
+        self._attr_native_value: Optional[float] = None
+        self._coordinator.register_entity(self)
 
     @property
-    def _collector(self):
-        return self._hass.data.get(DOMAIN, {}).get(self._entry_id)
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    @property
-    def native_unit_of_measurement(self) -> str | None:
-        return self._unit
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, "easun_inverter")},
+            name="Easun Inverter",
+            manufacturer="Easun",
+        )
 
     @property
     def native_value(self) -> Optional[float]:
-        if self._read_key is None:
-            return self._last_set
-        val = _get_status_value(self._hass, self._entry_id, self._read_key)
-        if val is None:
-            return self._last_set
+        value = self._coordinator.get_data("system", self._key)
         try:
-            return float(val)
-        except Exception:  # noqa: BLE001
-            return val
+            self._attr_native_value = float(value) if value is not None else None
+        except (ValueError, TypeError):
+            # Keep old value if conversion fails
+            pass
+        return self._attr_native_value
 
+    def update_from_collector(self) -> None:
+        """Called by the coordinator when data is updated."""
+        self.async_write_ha_state()
+
+    async def _get_isolar(self):
+        return self._coordinator._isolar, self._coordinator
+
+
+# --- concrete numbers ---
+
+class BatteryRechargeVoltage(_BaseNumber):
     async def async_set_native_value(self, value: float) -> None:
-        c = self._collector
-        if not c:
-            _LOGGER.warning("Collector not ready yet; cannot set %s", self._name)
+        isolar, coord = await self._get_isolar()
+        if not isolar:
             return
-        ok = await self._setter(c.isolar, value)
+        ok = await isolar.set_battery_recharge_voltage(value)
+        _LOGGER.info("Set Battery Re-Charge Voltage -> %s", ok)
         if ok:
-            self._last_set = float(value)
-            self.async_write_ha_state()
-            _LOGGER.info("Set %s -> %s", self._name, ok)
-        else:
-            _LOGGER.warning("Failed to set %s to %s", self._name, value)
+            await coord.update_data()
 
-    async def async_added_to_hass(self) -> None:
-        @callback
-        def _updated():
-            self.async_write_ha_state()
-        self._unsub = async_dispatcher_connect(self.hass, SIGNAL_COLLECTOR_UPDATED, _updated)
 
-    async def async_will_remove_from_hass(self) -> None:
-        if self._unsub:
-            self._unsub()
-            self._unsub = None
+class BatteryRedischargeVoltage(_BaseNumber):
+    async def async_set_native_value(self, value: float) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar:
+            return
+        ok = await isolar.set_battery_redischarge_voltage(value)
+        _LOGGER.info("Set Battery Re-Discharge Voltage -> %s", ok)
+        if ok:
+            await coord.update_data()
+
+
+class BatteryCutoffVoltage(_BaseNumber):
+    async def async_set_native_value(self, value: float) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar:
+            return
+        ok = await isolar.set_battery_cutoff_voltage(value)
+        _LOGGER.info("Set Battery Cut-Off Voltage -> %s", ok)
+        if ok:
+            await coord.update_data()
+
+
+class BatteryBulkVoltage(_BaseNumber):
+    async def async_set_native_value(self, value: float) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar:
+            return
+        ok = await isolar.set_battery_bulk_voltage(value)
+        _LOGGER.info("Set Battery Bulk/CV Voltage -> %s", ok)
+        if ok:
+            await coord.update_data()
+
+
+class BatteryFloatVoltage(_BaseNumber):
+    async def async_set_native_value(self, value: float) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar:
+            return
+        ok = await isolar.set_battery_float_voltage(value)
+        _LOGGER.info("Set Battery Float Voltage -> %s", ok)
+        if ok:
+            await coord.update_data()
+
+
+class CVStageMaxTime(_BaseNumber):
+    async def async_set_native_value(self, value: float) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar:
+            return
+        value = round(value / 5) * 5  # ensure multiple of 5
+        ok = await isolar.set_cv_stage_max_time(int(value))
+        _LOGGER.info("Set Max Charging Time at CV -> %s", ok)
+        if ok:
+            await coord.update_data()
+
+
+class MaxChargingCurrent(_BaseNumber):
+    async def async_set_native_value(self, value: float) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar:
+            return
+        ok = await isolar.set_max_charging_current(int(value), parallel_id=0)
+        _LOGGER.info("Set Max Charging Current -> %s", ok)
+        if ok:
+            await coord.update_data()
+
+
+class MaxUtilityChargingCurrent(_BaseNumber):
+    async def async_set_native_value(self, value: float) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar:
+            return
+        ok = await isolar.set_max_utility_charging_current(int(value), parallel_id=0)
+        _LOGGER.info("Set Max Utility Charging Current -> %s", ok)
+        if ok:
+            await coord.update_data()
+
+
+class MaxDischargeCurrent(_BaseNumber):
+    async def async_set_native_value(self, value: float) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar:
+            return
+        ok = await isolar.set_max_discharge_current(int(value))
+        _LOGGER.info("Set Max Discharge Current -> %s", ok)
+        if ok:
+            await coord.update_data()
+
+
+# Equalization parameters
+
+class EqTimeMinutes(_BaseNumber):
+    async def async_set_native_value(self, value: float) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar:
+            return
+        value = round(value / 5) * 5
+        ok = await isolar.equalization_set_time(int(value))
+        _LOGGER.info("Equalization set time -> %s", ok)
+        if ok:
+            await coord.update_data()
+
+
+class EqPeriodDays(_BaseNumber):
+    async def async_set_native_value(self, value: float) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar:
+            return
+        ok = await isolar.equalization_set_period(int(value))
+        _LOGGER.info("Equalization set period -> %s", ok)
+        if ok:
+            await coord.update_data()
+
+
+class EqVoltage(_BaseNumber):
+    async def async_set_native_value(self, value: float) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar:
+            return
+        ok = await isolar.equalization_set_voltage(float(value))
+        _LOGGER.info("Equalization set voltage -> %s", ok)
+        if ok:
+            await coord.update_data()
+
+
+class EqOvertimeMinutes(_BaseNumber):
+    async def async_set_native_value(self, value: float) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar:
+            return
+        value = round(value / 5) * 5
+        ok = await isolar.equalization_set_over_time(int(value))
+        _LOGGER.info("Equalization set over-time -> %s", ok)
+        if ok:
+            await coord.update_data()
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, add_entities: AddEntitiesCallback) -> None:
+    coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
+    entities: list[NumberEntity] = [
+        BatteryRechargeVoltage(coordinator, "Battery Re-Charge Voltage", "battery_recharge_voltage", 22.0, 62.0, 0.1, "V"),
+        BatteryRedischargeVoltage(coordinator, "Battery Re-Discharge Voltage", "battery_redischarge_voltage", 0.0, 62.0, 0.1, "V"),
+        BatteryCutoffVoltage(coordinator, "Battery Cut-Off Voltage", "battery_undervoltage", 36.0, 48.0, 0.1, "V"),
+        BatteryBulkVoltage(coordinator, "Battery Bulk/CV Voltage", "battery_bulk_voltage", 24.0, 64.0, 0.1, "V"),
+        BatteryFloatVoltage(coordinator, "Battery Float Voltage", "battery_float_voltage", 24.0, 64.0, 0.1, "V"),
+        CVStageMaxTime(coordinator, "Max Charging Time at CV", "max_charging_time_cv", 0, 900, 5, "min"),
+        MaxChargingCurrent(coordinator, "Max Charging Current", "max_charging_current", 0, 150, 1, "A"),
+        MaxUtilityChargingCurrent(coordinator, "Max Utility Charging Current", "max_ac_charging_current", 0, 30, 1, "A"),
+        MaxDischargeCurrent(coordinator, "Max Discharging Current", "max_discharging_current", 0, 150, 1, "A"),
+        # Equalization
+        EqTimeMinutes(coordinator, "Equalization Time", "eq_time", 5, 900, 5, "min"),
+        EqPeriodDays(coordinator, "Equalization Period", "eq_period", 0, 90, 1, "days"),
+        EqVoltage(coordinator, "Equalization Voltage", "eq_voltage", 24.0, 64.0, 0.01, "V"),
+        EqOvertimeMinutes(coordinator, "Equalization Over-time", "eq_overtime", 5, 900, 5, "min"),
+    ]
+    add_entities(entities)
+    _LOGGER.debug("Number entities added")
