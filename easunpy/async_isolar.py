@@ -3,19 +3,17 @@ easunpy.async_isolar
 --------------------
 Async high-level API for Easun/Voltronic inverters.
 
-- Preserves the original constructor used by sensor.py:
+- Constructor stays compatible with sensor.py:
     AsyncISolar(inverter_ip, local_ip, model="ISOLAR_SMG_II_11K")
-- Keeps the working ASCII read path (QPIGS/QPIGS2/QMOD/QPIWS/QPIRI).
-- Adds write (settings) helpers that send one-off ASCII commands and
-  check for (ACK)/(NAK).
-- IMPORTANT: When the TCP client is not connected yet, polls now return
-  (None, None, None, None, None) instead of raising, so the update loop
-  doesn’t record failures just for no-connection.
+- ASCII read path (QPIGS/QPIGS2/QMOD/QPIWS/QPIRI).
+- Settings helpers (apply_setting + typed wrappers).
+- IMPORTANT: Decoding is now robust to both bytes and hex-string inputs.
+  If the underlying decode expects a hex str, we pass resp.hex() automatically.
 
-This file depends on:
-- easunpy.async_modbusclient.AsyncModbusClient  (server/tunnel transport)
+Depends on:
+- easunpy.async_modbusclient.AsyncModbusClient
 - easunpy.modbusclient.create_ascii_request / decode_ascii_response
-- easunpy.models dataclasses (BatteryData, PVData, GridData, OutputData, SystemStatus, OperatingMode)
+- easunpy.models dataclasses
 """
 
 from __future__ import annotations
@@ -62,6 +60,22 @@ class AsyncISolar:
         self._transaction_id = (tid + 1) & 0xFFFF
         return tid
 
+    # ---------------- Internal decode helper (bytes OR hex string) ----------------
+
+    @staticmethod
+    def _safe_decode(resp: Optional[bytes | str]) -> Optional[str]:
+        """Decode a full Modbus-FF04 ASCII response from either bytes or hex-string."""
+        if resp is None:
+            return None
+        try:
+            return decode_ascii_response(resp)
+        except TypeError as e:
+            # Handle "fromhex() argument must be str, not bytes" (underlying expects hex string)
+            if "fromhex" in str(e):
+                if isinstance(resp, (bytes, bytearray, memoryview)):
+                    return decode_ascii_response(bytes(resp).hex())
+            raise
+
     # ---------------------------------------------------------------------
     # READ PATH (QPIGS/QPIGS2/QMOD/QPIWS/QPIRI) with graceful no-connection
     # ---------------------------------------------------------------------
@@ -86,11 +100,11 @@ class AsyncISolar:
             return None, None, None, None, None
 
         # Decode (each decode returns a raw "(...)" string or None)
-        raw_qpigs = decode_ascii_response(responses[0]) if responses[0] else None
-        raw_qpigs2 = decode_ascii_response(responses[1]) if responses[1] else None
-        raw_qmod = decode_ascii_response(responses[2]) if responses[2] else None
-        raw_qpiws = decode_ascii_response(responses[3]) if responses[3] else None
-        raw_qpiri = decode_ascii_response(responses[4]) if responses[4] else None
+        raw_qpigs = self._safe_decode(responses[0])
+        raw_qpigs2 = self._safe_decode(responses[1])
+        raw_qmod = self._safe_decode(responses[2])
+        raw_qpiws = self._safe_decode(responses[3])
+        raw_qpiri = self._safe_decode(responses[4])
 
         # If the inverter sent nothing useful yet, skip gracefully.
         if not raw_qpigs or not raw_qmod:
@@ -110,21 +124,25 @@ class AsyncISolar:
         vals: Dict[str, Any] = {}
 
         # -------- QPIGS (runtime) --------
+        # Indices per your PS parser (21 fields):
+        # 0 GV, 1 GF, 2 OV, 3 OF, 4 OVA, 5 OW, 6 OLOAD%, 7 BUSV,
+        # 8 BV, 9 BchgA, 10 BCap%, 11 HeatSinkC,
+        # 12 PV1A, 13 PV1V, 14 BattV_SCC, 15 BdisA,
+        # 16 DevStatus, 17 FanOffset x10mV, 18 EEPROM, 19 PV1W, 20 DevStatus2
         vals["grid_voltage"] = float(qpigs[0])
-        vals["grid_frequency"] = float(qpigs[1]) * 100
+        vals["grid_frequency"] = float(qpigs[1])
         vals["output_voltage"] = float(qpigs[2])
-        vals["output_frequency"] = float(qpigs[3]) * 100
+        vals["output_frequency"] = float(qpigs[3])
         vals["output_apparent_power"] = int(float(qpigs[4]))
         vals["output_power"] = int(float(qpigs[5]))
         vals["output_load_percentage"] = int(float(qpigs[6]))
-
         vals["bus_voltage"] = float(qpigs[7])
 
         vals["battery_voltage"] = float(qpigs[8])
         battery_chg = float(qpigs[9])                # A
         vals["battery_charge_current"] = battery_chg
         vals["battery_soc"] = int(float(qpigs[10]))  # %
-        vals["battery_temperature"] = int(float(qpigs[11]))  # inverter heat-sink temp
+        vals["battery_temperature"] = int(float(qpigs[11]))  # inverter heat-sink temp (°C)
 
         pv1_curr = float(qpigs[12])
         pv1_volt = float(qpigs[13])
@@ -136,7 +154,7 @@ class AsyncISolar:
         vals["eeprom_version"] = qpigs[18]
 
         raw_pv1_power = qpigs[19]
-        pv1_power = int(float(raw_pv1_power) * 1000) if "." in raw_pv1_power else int(float(raw_pv1_power))
+        pv1_power = int(float(raw_pv1_power))
         vals["device_status_flags2"] = qpigs[20]
 
         vals["battery_current"] = battery_chg - battery_dis
@@ -154,7 +172,7 @@ class AsyncISolar:
             pv2_curr = float(qpigs2[0])
             pv2_volt = float(qpigs2[1])
             raw_pv2_power = qpigs2[2]
-            pv2_power = int(float(raw_pv2_power) * 1000) if "." in raw_pv2_power else int(float(raw_pv2_power))
+            pv2_power = int(float(raw_pv2_power))
             vals["pv2_current"] = pv2_curr
             vals["pv2_voltage"] = pv2_volt
             vals["pv2_power"] = pv2_power
@@ -186,6 +204,12 @@ class AsyncISolar:
         elif qmod == "B":
             vals["operation_mode"] = OperatingMode.SBU.value
             vals["mode_name"] = "Battery Mode"
+        elif qmod == "S":
+            vals["operation_mode"] = OperatingMode.IDLE.value
+            vals["mode_name"] = "Standby Mode"
+        elif qmod == "F":
+            vals["operation_mode"] = OperatingMode.FAULT.value
+            vals["mode_name"] = "Fault Mode"
         else:
             vals["operation_mode"] = OperatingMode.FAULT.value
             vals["mode_name"] = f"UNKNOWN ({qmod})"
@@ -414,7 +438,7 @@ class AsyncISolar:
         resp = await self.client.send_ascii_command(packet)
         if not resp:
             return False
-        payload = decode_ascii_response(resp) or ""
+        payload = self._safe_decode(resp) or ""
         _LOGGER.debug("apply_setting(%s) -> %s", command, payload)
         return self._ack_ok(payload)
 
