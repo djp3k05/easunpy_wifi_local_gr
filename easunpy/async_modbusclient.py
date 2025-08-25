@@ -4,18 +4,18 @@ easunpy.async_modbusclient
 TCP "cloud-server" shim for Voltronic/PI18 ASCII via the FF 04 wrapper.
 
 This version:
-- Starts the listener EARLY and keeps it persistent.
+- Starts the TCP listener EARLY and keeps it persistent.
 - Polls are NON-BLOCKING when no client is connected (we skip that cycle).
-- Sends a UNICAST UDP discovery "poke" to the known inverter_ip to
-  trigger the Wi-Fi dongle to connect back to our TCP server (port 502).
-- Optional broadcast can be enabled via env var EASUN_DISCOVERY_BROADCAST=1.
+- Restores the original UDP "poke" used by your dongle:
+    unicast to <inverter_ip>:58899 with payload
+        b"set>server=<local_ip>:<port>;"
+  sent periodically until the inverter connects.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import socket
 import struct
 import time
@@ -48,11 +48,9 @@ class AsyncModbusClient:
         self._lock = asyncio.Lock()
         self._trans_id = int(time.time()) & 0xFFFF
 
-        # UDP discovery management
+        # UDP discovery management (the original working flow)
         self._udp_task: Optional[asyncio.Task] = None
-        self._udp_interval = 5.0  # seconds between discovery bursts
-        # Broadcast disabled by default to match user's original working setup.
-        self._udp_broadcast_enabled = os.getenv("EASUN_DISCOVERY_BROADCAST", "0") == "1"
+        self._udp_interval = 5.0  # seconds between discovery bursts (keep it gentle)
 
         # Start listener early (best effort). If no loop yet, we start on first use.
         try:
@@ -135,7 +133,7 @@ class AsyncModbusClient:
         """Ensure the listener is up; do not wait for a client connection here."""
         if self._server is None:
             await self.start()
-        # Also ensure UDP discovery is running (if enabled)
+        # Also ensure UDP discovery is running
         self._ensure_udp_task()
 
     def is_connected(self) -> bool:
@@ -175,34 +173,25 @@ class AsyncModbusClient:
         self._trans_id = (self._trans_id + 1) & 0xFFFF
         return self._trans_id
 
-    # ---------------- UDP discovery ----------------
+    # ---------------- UDP discovery (original working method) ----------------
+
+    def _discovery_payload(self) -> bytes:
+        # EXACTLY what your old flow used:
+        #   set>server=<LOCAL_IP>:<PORT>;
+        return f"set>server={self._local_ip}:{self._port};".encode("ascii")
 
     async def _udp_discovery_loop(self) -> None:
         """
-        Periodically send discovery "pokes" to nudge the Wi-Fi dongle to connect
-        back to our TCP listener. Runs even if not connected; harmless once connected.
+        Periodically send the unicast discovery "poke" that tells the Wi-Fi dongle
+        where to connect. We keep sending every few seconds; once the inverter
+        connects, the TCP path takes over and the loop stays lightweight.
         """
-        # Minimal probe set to match your original setup:
-        probes: List[Tuple[bytes, int]] = [
-            (b"WIFIKIT-214028-READ", 48899),  # widely used by many Wi-Fi serial modules
-        ]
+        payload = self._discovery_payload()
+        target = (self._inverter_ip, 58899)
 
-        # Targets: **unicast only** to the configured inverter_ip.
-        targets: List[Tuple[str, int, bytes]] = []
-        for payload, port in probes:
-            targets.append((self._inverter_ip, port, payload))
-
-        # Optional broadcast if explicitly requested via env var.
-        if self._udp_broadcast_enabled:
-            for payload, port in probes:
-                targets.append(("255.255.255.255", port, payload))
-
-        # Bind a UDP socket for sending (bind to local_ip if provided)
+        # Bind a UDP socket for sending (bind to local_ip if available)
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-            # Broadcast only if explicitly enabled
-            if self._udp_broadcast_enabled:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             # Prefer sending out the intended interface when possible
             try:
                 if self._local_ip and self._local_ip != "0.0.0.0":
@@ -215,19 +204,15 @@ class AsyncModbusClient:
             _LOGGER.warning("UDP discovery disabled (socket error): %s", exc, exc_info=False)
             return
 
-        _LOGGER.debug(
-            "UDP discovery loop started (interval=%ss, broadcast=%s)", self._udp_interval, self._udp_broadcast_enabled
-        )
+        _LOGGER.debug("UDP discovery loop started (interval=%ss, target=%s:%s)", self._udp_interval, target[0], target[1])
 
         try:
             while True:
-                # Fire a short burst to all targets
-                for host, port, payload in targets:
-                    try:
-                        sock.sendto(payload, (host, port))
-                        _LOGGER.debug("UDP discovery sent to %s:%s payload=%r", host, port, payload)
-                    except Exception as exc:
-                        _LOGGER.debug("UDP send error to %s:%s -> %s", host, port, exc, exc_info=False)
+                try:
+                    sock.sendto(payload, target)
+                    _LOGGER.debug("UDP discovery sent to %s:%s payload=%r", target[0], target[1], payload)
+                except Exception as exc:
+                    _LOGGER.debug("UDP send error to %s:%s -> %s", target[0], target[1], exc, exc_info=False)
 
                 await asyncio.sleep(self._udp_interval)
         except asyncio.CancelledError:
