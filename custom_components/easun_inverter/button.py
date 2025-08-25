@@ -11,15 +11,13 @@ _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities) -> None:
-    group = hass.data[DOMAIN][entry.entry_id]
-    collector = group
-
+    entry_id = entry.entry_id
     async_add_entities(
         [
-            SyncTimeButton(collector),
-            ResetPVLoadEnergyButton(collector),
-            EraseDataLogButton(collector),
-            EqualizationNowButton(collector),
+            SyncTimeButton(hass, entry_id),
+            ResetPVLoadEnergyButton(hass, entry_id),
+            EraseDataLogButton(hass, entry_id),
+            EqualizationNowButton(hass, entry_id),
         ]
     )
     _LOGGER.debug("Button entities added")
@@ -28,8 +26,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 class _BaseBtn(ButtonEntity):
     _attr_should_poll = False
 
-    def __init__(self, collector):
-        self.collector = collector
+    def __init__(self, hass: HomeAssistant, entry_id: str):
+        self._hass = hass
+        self._entry_id = entry_id
+
+    @property
+    def _collector(self):
+        return self._hass.data.get(DOMAIN, {}).get(self._entry_id)
 
 
 class SyncTimeButton(_BaseBtn):
@@ -38,7 +41,11 @@ class SyncTimeButton(_BaseBtn):
         return "Sync Inverter Time"
 
     async def async_press(self) -> None:
-        ok = await self.collector.isolar.set_datetime()
+        c = self._collector
+        if not c:
+            _LOGGER.warning("Collector not ready yet; cannot sync time")
+            return
+        ok = await c.isolar.set_datetime()
         _LOGGER.info("Sync inverter time -> %s", ok)
 
 
@@ -48,7 +55,11 @@ class ResetPVLoadEnergyButton(_BaseBtn):
         return "Reset PV/Load Energy"
 
     async def async_press(self) -> None:
-        ok = await self.collector.isolar.reset_pv_load_energy()
+        c = self._collector
+        if not c:
+            _LOGGER.warning("Collector not ready yet; cannot reset energy")
+            return
+        ok = await c.isolar.reset_pv_load_energy()
         _LOGGER.info("Reset PV/Load Energy -> %s", ok)
 
 
@@ -58,7 +69,11 @@ class EraseDataLogButton(_BaseBtn):
         return "Erase Data Log"
 
     async def async_press(self) -> None:
-        ok = await self.collector.isolar.erase_data_log()
+        c = self._collector
+        if not c:
+            _LOGGER.warning("Collector not ready yet; cannot erase data log")
+            return
+        ok = await c.isolar.erase_data_log()
         _LOGGER.info("Erase Data Log -> %s", ok)
 
 
@@ -68,5 +83,9 @@ class EqualizationNowButton(_BaseBtn):
         return "Equalization Now"
 
     async def async_press(self) -> None:
-        ok = await self.collector.isolar.equalization_activate_now(True)
+        c = self._collector
+        if not c:
+            _LOGGER.warning("Collector not ready yet; cannot trigger equalization")
+            return
+        ok = await c.isolar.equalization_activate_now(True)
         _LOGGER.info("Equalization Now -> %s", ok)

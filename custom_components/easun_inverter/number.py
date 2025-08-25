@@ -14,11 +14,10 @@ _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities) -> None:
-    group = hass.data[DOMAIN][entry.entry_id]
-    collector = group
+    entry_id = entry.entry_id
 
     def N(name: str, unit: str, native_step: float, getter: Callable, setter: Callable, min_v: float, max_v: float):
-        return SettingNumber(collector, name, unit, native_step, getter, setter, min_v, max_v)
+        return SettingNumber(hass, entry_id, name, unit, native_step, getter, setter, min_v, max_v)
 
     entities = [
         N("Battery Re-Charge Voltage", "V", 0.1,
@@ -32,7 +31,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
           0.0, 62.0),
 
         N("Battery Cut-Off Voltage", "V", 0.1,
-          lambda c: None,  # not readable via QPIRI; leave as last known/unknown
+          lambda c: None,  # not readable via QPIRI on many firmwares
           lambda iso, v: iso.set_battery_cutoff_voltage(v),
           36.0, 48.0),
 
@@ -66,7 +65,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
           lambda iso, v: iso.set_max_discharge_current(int(v)),
           0, 150),
 
-        # Equalization values are not exposed by QPIRI on this model; show Unknown until set.
+        # Equalization values (usually not readable)
         N("Equalization Time", "min", 5,
           lambda c: None, lambda iso, v: iso.equalization_set_time(int(v)), 5, 900),
         N("Equalization Period", "days", 1,
@@ -84,8 +83,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 class SettingNumber(NumberEntity):
     _attr_should_poll = False
 
-    def __init__(self, collector, name: str, unit: str, step: float, getter, setter, min_v, max_v):
-        self.collector = collector
+    def __init__(self, hass: HomeAssistant, entry_id: str, name: str, unit: str, step: float, getter, setter, min_v, max_v):
+        self._hass = hass
+        self._entry_id = entry_id
         self._name = name
         self._unit = unit
         self._getter = getter
@@ -97,6 +97,10 @@ class SettingNumber(NumberEntity):
         self._unsub = None
 
     @property
+    def _collector(self):
+        return self._hass.data.get(DOMAIN, {}).get(self._entry_id)
+
+    @property
     def name(self) -> str:
         return self._name
 
@@ -106,20 +110,23 @@ class SettingNumber(NumberEntity):
 
     @property
     def native_value(self) -> Optional[float]:
-        # Prefer live value from inverter; fallback to last user-set value (for non-readable settings)
+        c = self._collector
         val = None
         try:
-            val = self._getter(self.collector)
+            if c:
+                val = self._getter(c)
         except Exception:  # noqa: BLE001
             val = None
         return val if val is not None else self._last_set
 
     async def async_set_native_value(self, value: float) -> None:
-        iso = self.collector.isolar
-        ok = await self._setter(iso, value)
+        c = self._collector
+        if not c:
+            _LOGGER.warning("Collector not ready yet; cannot set %s", self._name)
+            return
+        ok = await self._setter(c.isolar, value)
         if ok:
             self._last_set = float(value)
-            # Let the next scheduled poll refresh everything; also write state now for UX.
             self.async_write_ha_state()
             _LOGGER.info("Set %s -> %s", self._name, ok)
         else:
