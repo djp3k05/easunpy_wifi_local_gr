@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import asyncio
 import logging
-from dataclasses import asdict
 from datetime import timedelta
-from typing import Any, Dict, Optional, Tuple
+from typing import Optional
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.dispatcher import async_dispatcher_send, async_dispatcher_connect
 from homeassistant.helpers.event import async_track_time_interval
 
 from easunpy.async_isolar import AsyncISolar
@@ -106,7 +104,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     def add(name: str, icon: str, unit: Optional[str], value_fn):
         entities.append(GenericSensor(collector, name, icon, unit, value_fn))
 
-    # Battery / PV / Grid / Output / SystemStatus mappings
+    # Battery
     add("Battery Voltage", "mdi:car-battery", "V", lambda c: getattr(c.last_battery, "voltage", None))
     add("Battery Current", "mdi:current-dc", "A", lambda c: getattr(c.last_battery, "current", None))
     add("Battery Power", "mdi:flash", "W", lambda c: getattr(c.last_battery, "power", None))
@@ -118,6 +116,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     add("Battery Voltage Offset for Fans", "mdi:fan", None, lambda c: getattr(c.last_battery, "voltage_offset_for_fans", None))
     add("EEPROM Version", "mdi:chip", None, lambda c: getattr(c.last_battery, "eeprom_version", None))
 
+    # PV
     add("PV Total Power", "mdi:solar-power", "W", lambda c: getattr(c.last_pv, "total_power", None))
     add("PV Charging Power", "mdi:solar-power", "W", lambda c: getattr(c.last_pv, "charging_power", None))
     add("PV Charging Current", "mdi:current-dc", "A", lambda c: getattr(c.last_pv, "charging_current", None))
@@ -130,10 +129,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     add("PV Generated Today", "mdi:counter", None, lambda c: getattr(c.last_pv, "pv_generated_today", None))
     add("PV Generated Total", "mdi:counter", None, lambda c: getattr(c.last_pv, "pv_generated_total", None))
 
+    # Grid
     add("Grid Voltage", "mdi:transmission-tower", "V", lambda c: getattr(c.last_grid, "voltage", None))
     add("Grid Power", "mdi:flash", "W", lambda c: getattr(c.last_grid, "power", None))
     add("Grid Frequency", "mdi:sine-wave", "Hz", lambda c: getattr(c.last_grid, "frequency", None))
 
+    # Output
     add("Output Voltage", "mdi:power-socket-eu", "V", lambda c: getattr(c.last_output, "voltage", None))
     add("Output Current", "mdi:current-ac", "A", lambda c: getattr(c.last_output, "current", None))
     add("Output Power", "mdi:flash", "W", lambda c: getattr(c.last_output, "power", None))
@@ -141,6 +142,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     add("Output Load Percentage", "mdi:percent", "%", lambda c: getattr(c.last_output, "load_percentage", None))
     add("Output Frequency", "mdi:sine-wave", "Hz", lambda c: getattr(c.last_output, "frequency", None))
 
+    # System status + QPIRI (to back-fill control defaults)
     add("Operating Mode", "mdi:power-settings", None, lambda c: getattr(c.last_status, "mode_name", None))
     add("Inverter Time", "mdi:clock-outline", None, lambda c: getattr(c.last_status, "inverter_time", None))
     add("Bus Voltage", "mdi:resistor", "V", lambda c: getattr(c.last_status, "bus_voltage", None))
@@ -148,7 +150,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     add("Device Status 2 Flags", "mdi:flag-outline", None, lambda c: getattr(c.last_status, "device_status_flags2", None))
     add("Warnings", "mdi:alert-outline", None, lambda c: getattr(c.last_status, "warnings", None))
 
-    # Ratings / settings (read from QPIRI so UI controls can show current values)
     add("Grid Rating Voltage", "mdi:alpha-g-circle", "V", lambda c: getattr(c.last_status, "grid_rating_voltage", None))
     add("Grid Rating Current", "mdi:alpha-g-circle", "A", lambda c: getattr(c.last_status, "grid_rating_current", None))
     add("AC Output Rating Voltage", "mdi:alpha-a-circle", "V", lambda c: getattr(c.last_status, "ac_output_rating_voltage", None))
@@ -216,9 +217,8 @@ class GenericSensor(SensorEntity):
         def _updated():
             self.async_write_ha_state()
 
-        self._unsub = self.hass.helpers.dispatcher.async_dispatcher_connect(
-            SIGNAL_COLLECTOR_UPDATED, _updated
-        )
+        # ✅ Correct dispatcher API (the previous version caused your line-219 errors)
+        self._unsub = async_dispatcher_connect(self.hass, SIGNAL_COLLECTOR_UPDATED, _updated)
 
     async def async_will_remove_from_hass(self) -> None:
         if self._unsub:
