@@ -25,32 +25,43 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
-# ---- small utils to read from dataclass OR dict ----
+# ---- helpers: read attr OR dict key; plus describe for debug ----
 def _get(obj: Any, keys: Iterable[str]) -> Any:
     """Return first non-None value among attribute-or-key candidates."""
     if obj is None:
         return None
     for k in keys:
-        # attribute
         if hasattr(obj, k):
             v = getattr(obj, k)
             if v is not None:
                 return v
-        # dict key
-        if isinstance(obj, dict) and k in obj:
-            v = obj[k]
-            if v is not None:
-                return v
+        if isinstance(obj, dict) and k in obj and obj[k] is not None:
+            return obj[k]
     return None
 
 
-class FG:
-    """Field getter callable used by sensors."""
-    __slots__ = ("src_attr", "keys")
+def _describe_obj(obj: Any) -> str:
+    if obj is None:
+        return "None"
+    try:
+        if isinstance(obj, dict):
+            ks = list(obj.keys())
+            return f"dict keys={ks[:25]}{'…' if len(ks) > 25 else ''}"
+        # dataclass or other object: list public attrs
+        attrs = [a for a in dir(obj) if not a.startswith("_") and not callable(getattr(obj, a, None))]
+        return f"{type(obj).__name__} attrs={attrs[:25]}{'…' if len(attrs) > 25 else ''}"
+    except Exception as e:  # noqa: BLE001
+        return f"{type(obj).__name__} (describe error: {e})"
 
-    def __init__(self, src_attr: str, *keys: str):
+
+class FG:
+    """Field getter callable used by sensors; also carries meta for logging & availability."""
+    __slots__ = ("src_attr", "keys", "name")
+
+    def __init__(self, src_attr: str, *keys: str, name: str = ""):
         self.src_attr = src_attr
         self.keys = keys
+        self.name = name  # optional human name for debug
 
     def __call__(self, collector: "DataCollector"):
         obj = getattr(collector, self.src_attr, None)
@@ -74,6 +85,7 @@ class DataCollector:
 
         self._task_unsub = None
         self._updating = False
+        self._dumped_once = False  # only log one deep snapshot
 
         _LOGGER.info("DataCollector initialized with model: %s", model)
 
@@ -98,7 +110,8 @@ class DataCollector:
         _LOGGER.debug("Starting data collector update")
         try:
             batt, pv, grid, out, status = await self.isolar.get_all_data()
-            if any(x is not None for x in (batt, pv, grid, out, status)):
+            got_any = any(x is not None for x in (batt, pv, grid, out, status))
+            if got_any:
                 if batt is not None:
                     self.last_battery = batt
                 if pv is not None:
@@ -109,8 +122,31 @@ class DataCollector:
                     self.last_output = out
                 if status is not None:
                     self.last_status = status
+
+                # One-time deep snapshot so we know exactly what's inside
+                if not self._dumped_once:
+                    _LOGGER.debug(
+                        "Snapshot shapes: battery=%s | pv=%s | grid=%s | output=%s | status=%s",
+                        _describe_obj(self.last_battery),
+                        _describe_obj(self.last_pv),
+                        _describe_obj(self.last_grid),
+                        _describe_obj(self.last_output),
+                        _describe_obj(self.last_status),
+                    )
+                    # Sample a few values to confirm mapping
+                    sample_batt_v = _get(self.last_battery, ("voltage", "battery_voltage"))
+                    sample_out_w = _get(self.last_output, ("power", "ac_output_active_power", "output_active_power"))
+                    sample_mode = _get(self.last_status, ("mode_name", "operating_mode"))
+                    _LOGGER.debug(
+                        "Sample values: BatteryVoltage=%s | OutputPower=%s | OperatingMode=%s",
+                        sample_batt_v, sample_out_w, sample_mode,
+                    )
+                    self._dumped_once = True
+
                 async_dispatcher_send(self.hass, SIGNAL_COLLECTOR_UPDATED)
                 _LOGGER.debug("Updated all registered sensors")
+            else:
+                _LOGGER.debug("Parsed response returned no data objects this cycle")
         except Exception as exc:  # noqa: BLE001
             _LOGGER.error("Error during data update: %s", getattr(exc, "args", [""])[0])
         finally:
@@ -138,7 +174,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     entities: list[SensorEntity] = []
 
     def add(name: str, icon: str, unit: Optional[str], getter: FG):
-        entities.append(GenericSensor(collector, name, icon, unit, getter))
+        getter.name = name
+        entities.append(GenericSensor(entry.entry_id, collector, name, icon, unit, getter))
 
     # Battery
     add("Battery Voltage", "mdi:car-battery", "V", FG("last_battery", "voltage", "battery_voltage"))
@@ -215,6 +252,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     add("Max Discharging Current", "mdi:current-dc", "A", FG("last_status", "max_discharging_current"))
 
     async_add_entities(entities)
+    _LOGGER.debug("Easun Inverter sensors added (%d entities)", len(entities))
 
     # Force one immediate refresh AFTER entities are added so they get their first state
     await collector.async_poll_once()
@@ -223,13 +261,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 class GenericSensor(SensorEntity):
     _attr_should_poll = False
 
-    def __init__(self, collector: DataCollector, name: str, icon: str, unit: str | None, getter: FG):
+    def __init__(self, entry_id: str, collector: DataCollector, name: str, icon: str, unit: str | None, getter: FG):
+        self._entry_id = entry_id
         self._collector = collector
         self._name = name
         self._icon = icon
         self._unit = unit
         self._getter = getter
         self._unsub = None
+        self._debug_once_logged = False
 
     @property
     def name(self) -> str:
@@ -244,17 +284,40 @@ class GenericSensor(SensorEntity):
         return self._unit
 
     @property
+    def available(self) -> bool:
+        """Mark available when the collector has the relevant last_* object set."""
+        src = getattr(self._collector, self._getter.src_attr, None)
+        return src is not None
+
+    @property
     def native_value(self):
         try:
-            return self._getter(self._collector)
-        except Exception:  # noqa: BLE001
+            val = self._getter(self._collector)
+            if val is None and not self._debug_once_logged:
+                src_obj = getattr(self._collector, self._getter.src_attr, None)
+                _LOGGER.debug(
+                    "Sensor '%s' has no value yet. Source=%s, tried keys=%s",
+                    self._name, _describe_obj(src_obj), list(self._getter.keys),
+                )
+                self._debug_once_logged = True
+            return val
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.debug("Sensor '%s' getter raised: %s", self._name, e)
             return None
 
     async def async_added_to_hass(self) -> None:
         @callback
         def _updated():
+            # helpful to see that dispatcher fired and we pushed a state
+            try:
+                val = self.native_value
+            except Exception:  # noqa: BLE001
+                val = None
+            _LOGGER.debug("Sensor write: %s = %s", self._name, val)
             self.async_write_ha_state()
+
         self._unsub = async_dispatcher_connect(self.hass, SIGNAL_COLLECTOR_UPDATED, _updated)
+        _LOGGER.debug("Sensor subscribed: %s (src=%s, keys=%s)", self._name, self._getter.src_attr, list(self._getter.keys))
 
     async def async_will_remove_from_hass(self) -> None:
         if self._unsub:
