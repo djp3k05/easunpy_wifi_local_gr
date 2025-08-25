@@ -178,8 +178,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     add("Max Charging Time at CV", "mdi:timer", "min", lambda c: getattr(c.last_status, "max_charging_time_cv", None))
     add("Max Discharging Current", "mdi:current-dc", "A", lambda c: getattr(c.last_status, "max_discharging_current", None))
 
+    # Register entities
     async_add_entities(entities)
-    # First immediate refresh already triggered by collector.start()
+
+    # 🔑 Force one immediate refresh AFTER entities are added so they get their first state
+    await collector.async_poll_once()
 
 
 class GenericSensor(SensorEntity):
@@ -216,8 +219,7 @@ class GenericSensor(SensorEntity):
         @callback
         def _updated():
             self.async_write_ha_state()
-
-        # ✅ Correct dispatcher API (the previous version caused your line-219 errors)
+        # Subscribe to collector refreshes
         self._unsub = async_dispatcher_connect(self.hass, SIGNAL_COLLECTOR_UPDATED, _updated)
 
     async def async_will_remove_from_hass(self) -> None:
