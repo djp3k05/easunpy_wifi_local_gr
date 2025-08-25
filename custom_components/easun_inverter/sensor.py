@@ -192,11 +192,11 @@ class RegisterScanSensor(SensorEntity):
         self._hass = hass
 
     @property
-def state(self):
+    def state(self):
         return self._state
 
     @property
-def device_info(self) -> DeviceInfo:
+    def device_info(self) -> DeviceInfo:
         return DeviceInfo(
             identifiers={(DOMAIN, "easun_inverter")},
             name="Easun Inverter",
@@ -216,15 +216,15 @@ class DeviceScanSensor(SensorEntity):
         self._hass = hass
 
     @property
-def state(self):
+    def state(self):
         return self._state
 
     @property
-def extra_state_attributes(self):
+    def extra_state_attributes(self):
         return self._hass.data.get(DOMAIN, {}).get("device_scan")
 
     @property
-def device_info(self) -> DeviceInfo:
+    def device_info(self) -> DeviceInfo:
         return DeviceInfo(
             identifiers={(DOMAIN, "easun_inverter")},
             name="Easun Inverter",
