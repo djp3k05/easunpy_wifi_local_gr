@@ -1,54 +1,303 @@
-# Define the service
-register_scan:
-  name: Register Scan
-  description: Scan inverter registers to help identify register mappings
-  fields:
-    start_register:
-      name: Start Register
-      description: Starting register number
-      required: false
-      default: 0
-      selector:
-        number:
-          min: 0
-          max: 65535
-          step: 1
-          mode: box
-    register_count:
-      name: Register Count
-      description: How many registers to scan
-      required: false
-      default: 100
-      selector:
-        number:
-          min: 1
-          max: 1000
-          step: 1
-          mode: box
+# Services for custom_components.easun_inverter
 
-device_scan:
-  name: Device ID Scan
-  description: Scan for device ID by trying different addresses
+send_ascii_setting:
+  name: Send raw ASCII setting
+  description: Send a raw PI18 ASCII command like POP00, PBFT54.0, etc. Use with care.
   fields:
-    start_id:
-      name: Start ID
-      description: Starting device ID (default 0)
-      required: false
-      default: 0
+    command:
+      description: ASCII command (without CRC)
+      example: "POP00"
+
+set_output_source_priority:
+  name: Set Output Source Priority
+  description: POP - 00 UtilitySolarBat, 01 SolarUtilityBat, 02 SolarBatUtility
+  fields:
+    mode:
+      example: "UtilitySolarBat"
+      selector:
+        select:
+          options:
+            - UtilitySolarBat
+            - SolarUtilityBat
+            - SolarBatUtility
+
+set_charger_source_priority:
+  name: Set Charger Source Priority
+  description: PCP - 01 Solar first, 02 Solar + Utility, 03 Only solar charging
+  fields:
+    mode:
+      selector:
+        select:
+          options:
+            - Solar first
+            - Solar + Utility
+            - Only solar charging
+
+set_grid_working_range:
+  name: Set Grid Working Range
+  description: PGR - 00 Appliance, 01 UPS
+  fields:
+    mode:
+      selector:
+        select:
+          options:
+            - Appliance
+            - UPS
+
+set_battery_type:
+  name: Set Battery Type
+  description: PBT - 00 AGM, 01 Flooded, 02 User, 03 Pylontech
+  fields:
+    battery_type:
+      selector:
+        select:
+          options: [AGM, Flooded, User, Pylontech]
+
+set_output_mode:
+  name: Set Output Mode
+  description: POPM - 00 single, 01 parallel, 02 P1(3φ), 03 P2(3φ), 04 P3(3φ), 05 P1(2φ), 06 P2(120°), 07 P2(180°)
+  fields:
+    mode:
+      selector:
+        select:
+          options:
+            - single
+            - parallel
+            - p1_3ph
+            - p2_3ph
+            - p3_3ph
+            - p1_2ph
+            - p2_2ph_120
+            - p2_2ph_180
+
+set_output_rated_voltage:
+  name: Set Output Rated Voltage
+  fields:
+    volts:
+      example: 230
+      selector:
+        number:
+          min: 110
+          max: 240
+          step: 1
+
+set_output_rated_frequency:
+  name: Set Output Rated Frequency
+  fields:
+    hz:
+      example: 50
+      selector:
+        select:
+          options: [50, 60]
+
+set_max_charging_current:
+  name: Set Max Charging Current
+  description: MNCHGC<mnnn>
+  fields:
+    amps:
+      example: 80
       selector:
         number:
           min: 0
-          max: 255
+          max: 150
           step: 1
-          mode: box
-    end_id:
-      name: End ID
-      description: Ending device ID (default 255)
-      required: false
-      default: 255
+    parallel_id:
+      example: 0
       selector:
         number:
           min: 0
-          max: 255
+          max: 9
           step: 1
-          mode: box 
+
+set_max_utility_charging_current:
+  name: Set Max Utility Charging Current
+  description: MUCHGC<mnn>
+  fields:
+    amps:
+      example: 10
+      selector:
+        number:
+          min: 0
+          max: 30
+          step: 1
+    parallel_id:
+      example: 0
+      selector:
+        number:
+          min: 0
+          max: 9
+          step: 1
+
+set_battery_recharge_voltage:
+  name: Set Battery Re-Charge Voltage
+  description: PBCV<nn.n>
+  fields:
+    volts:
+      example: 50.0
+      selector:
+        number:
+          min: 22
+          max: 62
+          step: 0.1
+
+set_battery_redischarge_voltage:
+  name: Set Battery Re-Discharge Voltage
+  description: PBDV<nn.n> (or 0.0)
+  fields:
+    volts:
+      example: 54.0
+      selector:
+        number:
+          min: 0
+          max: 62
+          step: 0.1
+
+set_battery_cutoff_voltage:
+  name: Set Battery Cut-Off Voltage
+  description: PSDV<nn.n>
+  fields:
+    volts:
+      example: 44.0
+      selector:
+        number:
+          min: 36
+          max: 48
+          step: 0.1
+
+set_battery_bulk_voltage:
+  name: Set Battery Bulk/CV Voltage
+  description: PCVV<nn.n> (or 0.0)
+  fields:
+    volts:
+      example: 56.4
+      selector:
+        number:
+          min: 0
+          max: 64
+          step: 0.1
+
+set_battery_float_voltage:
+  name: Set Battery Float Voltage
+  description: PBFT<nn.n> (or 0.0)
+  fields:
+    volts:
+      example: 54.0
+      selector:
+        number:
+          min: 0
+          max: 64
+          step: 0.1
+
+set_cv_stage_max_time:
+  name: Set Max Charging Time at C.V Stage
+  description: PCVT<nnn> (0..900, step 5; 0=auto)
+  fields:
+    minutes:
+      example: 60
+      selector:
+        number:
+          min: 0
+          max: 900
+          step: 5
+
+set_datetime:
+  name: Set Date/Time to Now
+  description: DAT<YYMMDDHHMMSS> (uses host time)
+  fields: {}
+
+equalization_enable:
+  name: Equalization - Enable/Disable
+  fields:
+    enabled:
+      selector:
+        boolean: {}
+
+equalization_set_time:
+  name: Equalization - Set Time (minutes)
+  fields:
+    minutes:
+      selector:
+        number:
+          min: 5
+          max: 900
+          step: 5
+
+equalization_set_period:
+  name: Equalization - Set Period (days)
+  fields:
+    days:
+      selector:
+        number:
+          min: 0
+          max: 90
+          step: 1
+
+equalization_set_voltage:
+  name: Equalization - Set Voltage
+  fields:
+    volts:
+      selector:
+        number:
+          min: 24
+          max: 64
+          step: 0.01
+
+equalization_set_over_time:
+  name: Equalization - Set Over-time (minutes)
+  fields:
+    minutes:
+      selector:
+        number:
+          min: 5
+          max: 900
+          step: 5
+
+equalization_activate_now:
+  name: Equalization - Activate Now
+  fields:
+    active:
+      selector:
+        boolean: {}
+
+battery_control:
+  name: Battery Charge/Discharge Control (PBATCD)
+  fields:
+    a:
+      description: Discharge completely on/off (1/0)
+      example: 1
+    b:
+      description: Discharge on/off but standby allowed (1/0)
+      example: 1
+    c:
+      description: Charge completely on/off (1/0)
+      example: 1
+
+set_max_discharge_current:
+  name: Set Max Discharge Current
+  description: PBATMAXDISC<nnn> (0 disables; 30..150A)
+  fields:
+    amps:
+      example: 100
+      selector:
+        number:
+          min: 0
+          max: 150
+          step: 1
+
+flag_set:
+  name: Toggle PE/PD Flag
+  description: Enable/disable flags (A buzzer, B bypass, K LCD escape, U restart, V overtemp restart, X backlight, Y alarm, Z fault record)
+  fields:
+    flag:
+      example: "A"
+    enable:
+      selector:
+        boolean: {}
+
+reset_pv_load_energy:
+  name: Reset PV/Load Energy (RTEY)
+  fields: {}
+
+erase_data_log:
+  name: Erase Data Log (RTDL)
+  fields: {}

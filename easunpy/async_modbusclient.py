@@ -1,224 +1,207 @@
-# async_modbusclient.py
+"""
+easunpy.async_modbusclient
+--------------------------
+Minimal TCP 'cloud-server' shim for Voltronic/PI18 ASCII over the FF 04 wrapper.
+
+Adds: send_ascii_command() used by the Settings API.
+Does not change read behaviour for sensors.
+
+Logging mirrors the existing style seen in your logs.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import logging
-import socket
+import struct
 import time
-from typing import Set, Optional
+from typing import Optional
 
-logger = logging.getLogger(__name__)
+_LOGGER = logging.getLogger("easunpy.async_modbusclient")
 
-class DiscoveryProtocol(asyncio.DatagramProtocol):
-    """Protocol for UDP discovery of the inverter."""
-    def __init__(self, inverter_ip: str, message: bytes):
-        self.transport: Optional[asyncio.transports.DatagramTransport] = None
-        self.inverter_ip = inverter_ip
-        self.message = message
-        loop = asyncio.get_event_loop()
-        self.response_received = loop.create_future()
 
-    def connection_made(self, transport):
-        self.transport = transport
-        logger.debug(f"Sending UDP discovery message to {self.inverter_ip}:58899")
-        self.transport.sendto(self.message, (self.inverter_ip, 58899))
+def _crc16_xmodem(data: bytes) -> int:
+    """CRC-16/XMODEM as required by PI18 ASCII (poly=0x1021, init=0x0000)."""
+    crc = 0x0000
+    for b in data:
+        crc ^= (b << 8) & 0xFFFF
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
 
-    def datagram_received(self, data, addr):
-        logger.info(f"Received discovery response from {addr}")
-        if not self.response_received.done():
-            self.response_received.set_result(True)
 
-    def error_received(self, exc):
-        logger.error(f"UDP discovery error received: {exc}")
-        if not self.response_received.done():
-            self.response_received.set_result(False)
+def _adjust_crc_byte(b: int) -> int:
+    # Per vendor wrapper rule: avoid reserved 0x0A, 0x0D, 0x28 by +1 on those bytes.
+    return b + 1 if b in (0x0A, 0x0D, 0x28) else b
+
+
+def _build_ascii_payload(cmd: str) -> bytes:
+    """
+    Build the 'data' segment: ASCII + CRC (with reserved byte adjustment) + <CR>.
+    Example: b'QPIGS' + crc_hi + crc_lo + 0x0D
+    """
+    raw = cmd.encode("ascii")
+    crc = _crc16_xmodem(raw)
+    crc_hi = _adjust_crc_byte((crc >> 8) & 0xFF)
+    crc_lo = _adjust_crc_byte(crc & 0xFF)
+    return raw + bytes([crc_hi, crc_lo, 0x0D])
+
+
+def _wrap_cloud(trans_id: int, ascii_payload: bytes) -> bytes:
+    """
+    Wrap with Modbus/TCP-like header + FF 04 function (cloud tunnel):
+        [TID (2)][PID=0x0001 (2)][LEN (2)][UID=0xFF (1)][FC=0x04 (1)] + data
+    LEN counts bytes after LEN (i.e., unit+func+data).
+    """
+    length = len(ascii_payload) + 2  # + unit + function
+    header = struct.pack(">HHHBB", trans_id & 0xFFFF, 0x0001, length, 0xFF, 0x04)
+    return header + ascii_payload
+
+
+def _parse_cloud_response(pdu: bytes) -> Optional[str]:
+    """
+    Parse response and extract raw ASCII between '(' and before CRC+<CR>.
+    Returns a string that still starts with '(' (e.g. '(ACK', '(NAK', '(...').
+    """
+    if len(pdu) < 8:
+        return None
+    # Header: TID(2) PID(2) LEN(2) UID(1) FC(1)
+    try:
+        _, _, length, _, _ = struct.unpack(">HHHBB", pdu[:8])
+    except struct.error:
+        return None
+    if len(pdu) < 6 + length:
+        return None
+    data = pdu[8 : 6 + length]
+    if len(data) < 4:  # at least '(<CRC><CR)'
+        return None
+    # Strip CRC (2) + \r (1)
+    body = data[:-3]
+    try:
+        return body.decode("ascii", errors="ignore")
+    except Exception:
+        return None
 
 
 class AsyncModbusClient:
-    """
-    Minimal server-side TCP endpoint used by Easun/Voltronic WiFi modules:
-    - We send UDP: set>server=<local_ip>:<port>;
-    - The inverter connects back to us on that TCP port and we exchange frames.
-    """
-    def __init__(self, inverter_ip: str, local_ip: str, port: int = 8899):
-        self.inverter_ip = inverter_ip
-        self.local_ip = local_ip
-        self.port = port
+    """Listens on TCP and speaks the FF 04 tunnel with the inverter."""
 
-        self._lock = asyncio.Lock()
+    def __init__(self, local_ip: str, port: int = 502, connect_timeout: float = 10.0):
+        self._local_ip = local_ip
+        self._port = port
+        self._connect_timeout = connect_timeout
+
         self._server: Optional[asyncio.AbstractServer] = None
-        self._active_connections: Set[asyncio.StreamWriter] = set()
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
 
-        self._connection_future: Optional[asyncio.Future] = None
-        self._connection_established = False
-        self._last_activity = 0.0
-        self._connection_timeout = 30  # idle connection considered stale
+        self._trans_id = int(time.time()) & 0xFFFF
+        self._lock = asyncio.Lock()
+        self._client_ready = asyncio.Event()
 
-    async def _cleanup_server(self):
-        """Close all sockets and reset state to allow fresh binds."""
-        try:
-            # close client sockets
-            for w in list(self._active_connections):
-                try:
-                    if not w.is_closing():
-                        w.close()
-                        await w.wait_closed()
-                except Exception as e:
-                    logger.debug(f"Error closing connection: {e}")
-                finally:
-                    self._active_connections.discard(w)
-
-            # close server socket
-            if self._server is not None:
-                try:
-                    self._server.close()
-                    await self._server.wait_closed()
-                    logger.debug("Server cleaned up successfully")
-                except Exception as e:
-                    logger.debug(f"Error closing server: {e}")
-            await asyncio.sleep(0.2)  # give OS time to release the port
-        finally:
-            self._server = None
-            self._reader = None
-            self._writer = None
-            self._connection_established = False
-            if self._connection_future and not self._connection_future.done():
-                self._connection_future.set_result(False)
-            self._connection_future = None
-
-    async def _send_udp_discovery(self) -> bool:
-        """Send UDP discovery message and wait briefly for any reply."""
-        message = f"set>server={self.local_ip}:{self.port};".encode()
-        try:
-            transport, protocol = await asyncio.get_event_loop().create_datagram_endpoint(
-                lambda: DiscoveryProtocol(self.inverter_ip, message),
-                remote_addr=(self.inverter_ip, 58899),
-            )
-            try:
-                await asyncio.wait_for(protocol.response_received, timeout=2)
-                return True
-            except asyncio.TimeoutError:
-                logger.warning("UDP discovery response timed out")
-                return False
-            finally:
-                transport.close()
-        except Exception as e:
-            logger.error(f"UDP discovery error: {e}")
-            return False
-
-    async def _ensure_connection(self) -> bool:
-        """
-        Make sure we have a live connection:
-        - If stale, clean up.
-        - Else start a server and wait for inverter to connect back.
-        """
-        # active and not stale?
-        if self._connection_established and (time.time() - self._last_activity) < self._connection_timeout:
-            logger.debug("Reusing existing TCP connection")
-            return True
+    async def start(self) -> None:
+        """Start listening (idempotent)."""
         if self._server is not None:
-            logger.debug("Cleaning up previous server before starting a new one")
-            await self._cleanup_server()
-
-        # tell inverter where to connect
-        if not await self._send_udp_discovery():
-            return False
-
-        # create the TCP server and wait for accept
+            return
         try:
-            self._connection_future = asyncio.get_event_loop().create_future()
             self._server = await asyncio.start_server(
-                self._handle_connection,
-                self.local_ip,
-                self.port,
-                reuse_address=True,  # allow quick rebinds if we had timeouts/cancels
-                start_serving=True,
+                self._on_client, host=self._local_ip, port=self._port
             )
-            logger.debug(f"TCP server listening on {self.local_ip}:{self.port}")
+            _LOGGER.debug(
+                "TCP server listening on %s:%s", self._local_ip, self._port
+            )
+        except OSError as exc:
+            _LOGGER.error(
+                "Failed to start TCP server: %s", exc, exc_info=False
+            )
+            raise
+
+    async def stop(self) -> None:
+        """Stop server and drop connection."""
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
+        if self._writer is not None:
             try:
-                # give the inverter a bit more time to connect back
-                await asyncio.wait_for(self._connection_future, timeout=10)
-                return self._connection_established
-            except asyncio.TimeoutError:
-                logger.warning("Timeout waiting for client connection")
-                await self._cleanup_server()
-                return False
-        except OSError as e:
-            logger.error(f"Failed to start TCP server: {e}")
-            # try to cleanup and give OS a moment, then signal failure
-            await self._cleanup_server()
-            return False
-        except Exception as e:
-            logger.error(f"Unexpected error starting TCP server: {e}")
-            await self._cleanup_server()
-            return False
+                self._writer.close()
+                await self._writer.wait_closed()
+            except Exception:
+                pass
+        self._reader = None
+        self._writer = None
+        self._client_ready.clear()
+        _LOGGER.debug("Server cleaned up successfully")
 
-    async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """Accept callback from asyncio.start_server()."""
-        addr = writer.get_extra_info("peername")
-        logger.info(f"Client connected from {addr}")
+    async def _ensure_client(self) -> None:
+        """Wait for inverter client connection with timeout."""
+        if self._reader and self._writer and not self._writer.is_closing():
+            _LOGGER.debug("Reusing existing TCP connection")
+            return
+        if self._server is None:
+            await self.start()
+        try:
+            await asyncio.wait_for(self._client_ready.wait(), timeout=self._connect_timeout)
+        except asyncio.TimeoutError:
+            _LOGGER.warning("Timeout waiting for client connection")
+            await self.stop()
+            raise
 
-        # Replace any prior client
+    async def _on_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        # Take first client and close any old writer
         if self._writer and not self._writer.is_closing():
             try:
                 self._writer.close()
                 await self._writer.wait_closed()
             except Exception:
                 pass
-
         self._reader = reader
         self._writer = writer
-        self._active_connections.add(writer)
-        self._connection_established = True
-        self._last_activity = time.time()
+        self._client_ready.set()
 
-        if self._connection_future and not self._connection_future.done():
-            self._connection_future.set_result(True)
+    async def send_ascii_command(self, command: str, timeout: float = 5.0) -> str:
+        """
+        Send an ASCII command (e.g., 'POP00', 'PBCV54.0', 'QPIGS') and return the
+        raw string reply (e.g., '(ACK', '(NAK', '(...)').
 
-    async def send_bulk(self, hex_commands: list[str], retry_count: int = 5) -> list[str]:
-        """Send multiple frames on a single connection. Returns hex responses in order."""
+        This wraps cloud header and computes XMODEM CRC with reserved-byte fix.
+        """
         async with self._lock:
-            for attempt in range(retry_count):
-                responses: list[str] = []
-                ok = await self._ensure_connection()
-                if not ok:
-                    await asyncio.sleep(1)
-                    continue
+            await self._ensure_client()
 
-                try:
-                    for command in hex_commands:
-                        if self._writer is None or self._writer.is_closing():
-                            logger.warning("Connection closed while sending commands")
-                            self._connection_established = False
-                            break
+            # Build request
+            self._trans_id = (self._trans_id + 1) & 0xFFFF
+            payload = _build_ascii_payload(command)
+            packet = _wrap_cloud(self._trans_id, payload)
 
-                        logger.debug(f"Sending command: {command}")
-                        self._writer.write(bytes.fromhex(command))
-                        await self._writer.drain()
+            # Send
+            _LOGGER.debug("Sending command: %s", packet.hex())
+            try:
+                assert self._writer
+                self._writer.write(packet)
+                await self._writer.drain()
 
-                        # Read MBAP header to know length, then read rest
-                        resp = await asyncio.wait_for(self._reader.read(6), timeout=5)
-                        if len(resp) < 6:
-                            raise asyncio.TimeoutError("Short MBAP header")
-                        expected = int.from_bytes(resp[4:6], "big")
-                        body = await asyncio.wait_for(self._reader.read(expected), timeout=5)
-                        response = (resp + body).hex()
-                        logger.debug(f"Response: {response}")
-                        responses.append(response)
-                        self._last_activity = time.time()
-                        await asyncio.sleep(0.05)
+                # Read header (6) first
+                assert self._reader
+                header = await asyncio.wait_for(self._reader.readexactly(6), timeout=timeout)
+                # Determine LEN
+                length = struct.unpack(">H", header[4:6])[0]
+                rest = await asyncio.wait_for(self._reader.readexactly(length), timeout=timeout)
+                response = header + rest
+                _LOGGER.debug("Response: %s", response.hex())
+            except asyncio.TimeoutError:
+                _LOGGER.warning("No response for %s", command)
+                raise
+            except Exception as exc:
+                _LOGGER.error("Transport error on %s: %s", command, exc, exc_info=False)
+                await self.stop()
+                raise
 
-                    if len(responses) == len(hex_commands):
-                        return responses
+            parsed = _parse_cloud_response(response)
+            return parsed or ""
 
-                except asyncio.TimeoutError as e:
-                    logger.error(f"Timeout reading response: {e}")
-                except Exception as e:
-                    logger.error(f"Error during bulk send: {e}")
-
-                # something went wrong, reset connection and retry
-                await self._cleanup_server()
-                await asyncio.sleep(1)
-
-            logger.error("Failed to establish connection after all attempts")
-            return []
