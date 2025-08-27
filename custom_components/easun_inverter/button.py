@@ -1,91 +1,89 @@
+"""Button entities for one-shot actions."""
 from __future__ import annotations
 
 import logging
+
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities) -> None:
-    entry_id = entry.entry_id
-    async_add_entities(
-        [
-            SyncTimeButton(hass, entry_id),
-            ResetPVLoadEnergyButton(hass, entry_id),
-            EraseDataLogButton(hass, entry_id),
-            EqualizationNowButton(hass, entry_id),
-        ]
-    )
-    _LOGGER.debug("Button entities added")
-
-
-class _BaseBtn(ButtonEntity):
+class _BaseButton(ButtonEntity):
     _attr_should_poll = False
 
-    def __init__(self, hass: HomeAssistant, entry_id: str):
+    def __init__(self, hass: HomeAssistant, entry_id: str, name: str, key: str):
         self._hass = hass
         self._entry_id = entry_id
+        self._attr_name = name
+        self._attr_unique_id = f"easun_button_{key}"
 
     @property
-    def _collector(self):
-        return self._hass.data.get(DOMAIN, {}).get(self._entry_id)
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, "easun_inverter")},
+            name="Easun Inverter",
+            manufacturer="Easun",
+        )
+
+    async def _get_isolar(self):
+        store = self._hass.data.get(DOMAIN, {}).get(self._entry_id, {})
+        coord = store.get("coordinator")
+        if not coord:
+            return None, None
+        return coord._isolar, coord
 
 
-class SyncTimeButton(_BaseBtn):
-    @property
-    def name(self) -> str:
-        return "Sync Inverter Time"
-
+class SyncTimeButton(_BaseButton):
     async def async_press(self) -> None:
-        c = self._collector
-        if not c:
-            _LOGGER.warning("Collector not ready yet; cannot sync time")
+        isolar, coord = await self._get_isolar()
+        if not isolar:
             return
-        ok = await c.isolar.set_datetime()
+        ok = await isolar.set_datetime()
         _LOGGER.info("Sync inverter time -> %s", ok)
+        if ok:
+            await coord.update_data()
 
 
-class ResetPVLoadEnergyButton(_BaseBtn):
-    @property
-    def name(self) -> str:
-        return "Reset PV/Load Energy"
-
+class ResetEnergyButton(_BaseButton):
     async def async_press(self) -> None:
-        c = self._collector
-        if not c:
-            _LOGGER.warning("Collector not ready yet; cannot reset energy")
+        isolar, _ = await self._get_isolar()
+        if not isolar:
             return
-        ok = await c.isolar.reset_pv_load_energy()
-        _LOGGER.info("Reset PV/Load Energy -> %s", ok)
+        ok = await isolar.reset_pv_load_energy()
+        _LOGGER.info("Reset PV/Load energy -> %s", ok)
 
 
-class EraseDataLogButton(_BaseBtn):
-    @property
-    def name(self) -> str:
-        return "Erase Data Log"
-
+class EraseLogButton(_BaseButton):
     async def async_press(self) -> None:
-        c = self._collector
-        if not c:
-            _LOGGER.warning("Collector not ready yet; cannot erase data log")
+        isolar, _ = await self._get_isolar()
+        if not isolar:
             return
-        ok = await c.isolar.erase_data_log()
-        _LOGGER.info("Erase Data Log -> %s", ok)
+        ok = await isolar.erase_data_log()
+        _LOGGER.info("Erase data log -> %s", ok)
 
 
-class EqualizationNowButton(_BaseBtn):
-    @property
-    def name(self) -> str:
-        return "Equalization Now"
-
+class EqualizationNowButton(_BaseButton):
     async def async_press(self) -> None:
-        c = self._collector
-        if not c:
-            _LOGGER.warning("Collector not ready yet; cannot trigger equalization")
+        isolar, _ = await self._get_isolar()
+        if not isolar:
             return
-        ok = await c.isolar.equalization_activate_now(True)
-        _LOGGER.info("Equalization Now -> %s", ok)
+        ok = await isolar.equalization_activate_now(True)
+        _LOGGER.info("Equalization activate now -> %s", ok)
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, add_entities: AddEntitiesCallback) -> None:
+    entry_id = entry.entry_id
+    entities = [
+        SyncTimeButton(hass, entry_id, "Sync Inverter Time", "sync_time"),
+        ResetEnergyButton(hass, entry_id, "Reset PV/Load Energy", "reset_energy"),
+        EraseLogButton(hass, entry_id, "Erase Data Log", "erase_log"),
+        EqualizationNowButton(hass, entry_id, "Equalization Now", "eq_now"),
+    ]
+    add_entities(entities)
+    _LOGGER.debug("Button entities added")

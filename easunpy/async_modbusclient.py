@@ -1,3 +1,5 @@
+# easunpy/async_modbusclient.py
+
 """
 easunpy.async_modbusclient
 --------------------------
@@ -9,7 +11,7 @@ This version:
 - Restores the original UDP unicast "poke" your dongle expects:
     unicast to <inverter_ip>:58899 with payload
         b"set>server=<local_ip>:<port>;"
-  sent periodically.
+  sent periodically ONLY WHEN NOT CONNECTED.
 - ACCEPTS BOTH bytes AND str requests:
     * bytes are sent as-is
     * hex strings are converted with bytes.fromhex()
@@ -211,8 +213,8 @@ class AsyncModbusClient:
     async def _udp_discovery_loop(self) -> None:
         """
         Periodically send the unicast discovery "poke" that tells the Wi-Fi dongle
-        where to connect. We keep sending every few seconds; once the inverter
-        connects, the TCP path takes over and the loop stays lightweight.
+        where to connect. We keep sending every few seconds, but ONLY IF the
+        inverter is not already connected.
         """
         payload = self._discovery_payload()
         target = (self._inverter_ip, 58899)
@@ -236,11 +238,17 @@ class AsyncModbusClient:
 
         try:
             while True:
-                try:
-                    sock.sendto(payload, target)
-                    _LOGGER.debug("UDP discovery sent to %s:%s payload=%r", target[0], target[1], payload)
-                except Exception as exc:
-                    _LOGGER.debug("UDP send error to %s:%s -> %s", target[0], target[1], exc, exc_info=False)
+                # ** THE CHANGE IS HERE **
+                # Only send the discovery poke if the inverter is NOT already connected.
+                if not self.is_connected():
+                    try:
+                        sock.sendto(payload, target)
+                        _LOGGER.debug("UDP discovery sent (inverter not connected) to %s:%s payload=%r", target[0], target[1], payload)
+                    except Exception as exc:
+                        _LOGGER.debug("UDP send error to %s:%s -> %s", target[0], target[1], exc, exc_info=False)
+                else:
+                    _LOGGER.debug("Skipping UDP discovery (inverter is connected)")
+
 
                 await asyncio.sleep(self._udp_interval)
         except asyncio.CancelledError:
