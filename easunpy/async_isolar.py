@@ -513,8 +513,8 @@ class AsyncISolar:
 
     async def set_max_utility_charging_current(self, amps: int, parallel_id: int = 0) -> bool:
         a = int(amps)
-        if not (0 <= a <= 120): # Adjusted upper limit
-            raise ValueError("Utility max charging current must be 0..120 A")
+        if not (0 <= a <= 30):
+            raise ValueError("Utility max charging current must be 0..30 A")
         m = int(parallel_id)
         if not (0 <= m <= 9):
             raise ValueError("Parallel id must be 0..9")
@@ -530,14 +530,14 @@ class AsyncISolar:
         v = float(volts)
         if v == 0.0:
             return await self.apply_setting("PBDV00.0")
-        if not (24.0 <= v <= 64.0):
-            raise ValueError("Re-discharge voltage must be 24.0–64.0 V or 0.0")
+        if not (24.0 <= v <= 62.0):
+            raise ValueError("Re-discharge voltage must be 24.0–62.0 V or 0.0")
         return await self.apply_setting(f"PBDV{v:04.1f}")
 
     async def set_battery_cutoff_voltage(self, volts: float) -> bool:
         v = float(volts)
-        if not (36.0 <= v <= 54.0): # Adjusted upper limit
-            raise ValueError("Cut-off voltage must be ~40.0–54.0 V for 48V systems")
+        if not (36.0 <= v <= 48.0):
+            raise ValueError("Cut-off voltage must be ~42.0–48.0 V for 48V systems")
         return await self.apply_setting(f"PSDV{v:04.1f}")
 
     async def set_battery_bulk_voltage(self, volts: float) -> bool:
