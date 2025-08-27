@@ -182,7 +182,8 @@ class EasunSensor(SensorEntity):
         if self._converter and value is not None:
             value = self._converter(value)
         self._state = value
-
+        if self.hass:
+            self.async_write_ha_state()
 
 class RegisterScanSensor(SensorEntity):
     def __init__(self, hass: HomeAssistant):
