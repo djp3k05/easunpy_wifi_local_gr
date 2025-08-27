@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
+from .const import DOMAIN
 from homeassistant.core import HomeAssistant, ServiceCall
 import homeassistant.helpers.config_validation as cv
 import logging
@@ -14,8 +15,6 @@ from aiofiles.os import makedirs
 import asyncio
 
 _LOGGER = logging.getLogger(__name__)
-
-DOMAIN = "easun_inverter"
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 CONFIG_SCHEMA = cv.config_entry_only_config_schema("easun_inverter")
