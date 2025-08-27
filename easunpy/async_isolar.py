@@ -41,6 +41,10 @@ _LOGGER = logging.getLogger("easunpy.async_isolar")
 
 
 class AsyncISolar:
+    @staticmethod
+    def _norm_key(val: str) -> str:
+        s = str(val).lower().replace(' ', '').replace('+','')
+        return s
     """Asynchronous interface to ISolar/Voltronic inverters (Modbus TCP or ASCII)."""
 
     def __init__(self, inverter_ip: str, local_ip: str, model: str = "ISOLAR_SMG_II_11K"):
@@ -513,12 +517,25 @@ class AsyncISolar:
 
     async def set_max_utility_charging_current(self, amps: int, parallel_id: int = 0) -> bool:
         a = int(amps)
-        if not (0 <= a <= 30):
-            raise ValueError("Utility max charging current must be 0..30 A")
+        if not (0 <= a <= 150):
+            raise ValueError("Utility max charging current must be 0..150 A")
         m = int(parallel_id)
         if not (0 <= m <= 9):
             raise ValueError("Parallel id must be 0..9")
-        return await self.apply_setting(f"MUCHGC{m:d}{a:02d}")
+        candidates = [
+            f"MUCHGC{m:d}{a:03d}",  # 020, 100, 120
+            f"MUCHGC{m:d}{a:02d}",  # 20
+            f"MUCHGC{a:03d}",       # 020 (no parallel)
+            f"MUCHGC{a:02d}",       # 20  (no parallel)
+            f"MUCHGC{a}",           # 2 / 10 / 120
+        ]
+        for cmd in candidates:
+            ok = await self.apply_setting(cmd)
+            _LOGGER.debug("MUCHGC try %s -> %s", cmd, ok)
+            if ok:
+                _LOGGER.info("MUCHGC accepted format: %s", cmd)
+                return True
+        return False
 
     async def set_battery_recharge_voltage(self, volts: float) -> bool:
         v = float(volts)

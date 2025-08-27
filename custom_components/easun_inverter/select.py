@@ -73,7 +73,11 @@ class _BaseSelect(SelectEntity):
 
     def update_from_collector(self) -> None:
         """Called by the coordinator when data is updated."""
-        self.async_write_ha_state()
+        try:
+            if getattr(self, 'hass', None):
+                self.async_write_ha_state()
+        except Exception:
+            pass
 
     async def async_select_option(self, option: str) -> None:
         raise NotImplementedError
