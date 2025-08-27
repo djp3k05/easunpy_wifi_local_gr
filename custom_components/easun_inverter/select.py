@@ -32,7 +32,7 @@ POPM_OPTIONS: Final[list[str]] = [
     "Phase 2 of 2 Phase output (180°)",
 ]
 MAX_CHARGING_CURRENT_OPTIONS: Final[list[str]] = [str(i) for i in range(10, 121, 10)]
-MAX_UTILITY_CHARGING_CURRENT_OPTIONS: Final[list[str]] = ['2'] + [str(i) for i in range(10, 121, 10)]
+MAX_UTILITY_CHARGING_CURRENT_OPTIONS: Final[list[str]] = ['2'] + [str(i) for i in range(10, 121, 10)] + [str(i) for i in range(10, 121, 10)]
 
 
 class _BaseSelect(SelectEntity):
@@ -93,8 +93,17 @@ class OutputSourcePrioritySelect(_BaseSelect):
 
 
 class ChargerSourcePrioritySelect(_BaseSelect):
+    @staticmethod
+    def _decode_csp(value) -> Optional[str]:
+        if value is None:
+            return None
+        s = str(value)
+        if s.startswith('Only solar charging'):
+            return 'Only solar charging'
+        return s if s in PCP_OPTIONS else None
+
     def __init__(self, coordinator: DataCollector):
-        super().__init__(coordinator, "Charger Source Priority", "charger_source_priority", PCP_OPTIONS)
+        super().__init__(coordinator, 'Charger Source Priority', 'charger_source_priority', PCP_OPTIONS, decoder=ChargerSourcePrioritySelect._decode_csp)
 
     async def async_select_option(self, option: str) -> None:
         isolar, coord = await self._get_isolar()

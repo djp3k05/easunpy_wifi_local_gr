@@ -12,5 +12,5 @@
     "git+https://github.com/djp3k05/easunpy_wifi_local_gr.git@main#egg=easunpy",
     "aiofiles>=23.2.1"
   ],
-  "version": "3.0.73"
+  "version": "3.0.74"
   }
