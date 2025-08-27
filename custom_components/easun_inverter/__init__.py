@@ -1,47 +1,90 @@
+# custom_components/easun_inverter/__init__.py
+
 """Easun / Voltronic ASCII Inverter - integration bootstrap."""
 from __future__ import annotations
 
+import asyncio
 import logging
+from datetime import timedelta
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.const import Platform
+from homeassistant.helpers.event import async_track_time_interval
+
+# Import from the local 'easunpy' library
+from .easunpy.async_isolar import AsyncISolar
+from .sensor import DataCollector
 
 DOMAIN = "easun_inverter"
 _LOGGER = logging.getLogger(__name__)
 
-# We now expose control entities:
 PLATFORMS = [Platform.SENSOR, Platform.SELECT, Platform.NUMBER, Platform.BUTTON]
-
+DEFAULT_SCAN_INTERVAL = 30  # seconds
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
-    _LOGGER.debug("Setting up %s component", DOMAIN)
+    """Set up the component."""
     hass.data.setdefault(DOMAIN, {})
     return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up from a config entry."""
+    # Get config from the entry
+    inverter_ip = entry.data["inverter_ip"]
+    local_ip = entry.data["local_ip"]
+    model = entry.data["model"]
+    scan_interval = entry.options.get("scan_interval", DEFAULT_SCAN_INTERVAL)
+
+    # Create the client and the data collector (coordinator)
+    isolar = AsyncISolar(inverter_ip, local_ip, model)
+    coordinator = DataCollector(isolar)
+
+    # Store the coordinator in hass.data
     hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN].setdefault(entry.entry_id, {})  # sensor.py will populate coordinator
+    hass.data[DOMAIN][entry.entry_id] = {"coordinator": coordinator}
+    
+    # --- Set up the polling loop ---
+    is_updating = False
+    async def async_update_data(now=None):
+        """Fetch data from the inverter."""
+        nonlocal is_updating
+        if is_updating:
+            if not await coordinator.is_update_stuck():
+                return
+            _LOGGER.warning("Previous update stuck, forcing new cycle")
+        
+        is_updating = True
+        try:
+            await coordinator.update_data()
+        finally:
+            is_updating = False
+
+    # Create a scheduled task that calls async_update_data
+    update_listener = async_track_time_interval(
+        hass, async_update_data, timedelta(seconds=scan_interval)
+    )
+    # Store the listener so we can cancel it on unload
+    hass.data[DOMAIN][entry.entry_id]["update_listener"] = update_listener
+
+    # Forward the setup to the platforms (sensor, select, etc.)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # Optional: keep a couple of generic services for power users
-    # They will locate the coordinator/isolar created in sensor.py at call-time.
-    async def _get_isolar():
-        store = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
-        coord = store.get("coordinator")
-        if not coord:
-            return None
-        return getattr(coord, "_isolar", None)
+    # --- Register services ---
+    async def _get_isolar_from_coord():
+        return hass.data[DOMAIN][entry.entry_id]["coordinator"]._isolar
 
     async def send_ascii_setting(call: ServiceCall):
-        isolar = await _get_isolar()
+        isolar = await _get_isolar_from_coord()
         if not isolar or not hasattr(isolar, "apply_setting"):
             _LOGGER.error("Settings API not ready")
             return
         cmd = call.data["command"]
         ok = await isolar.apply_setting(cmd)
         _LOGGER.info("send_ascii_setting %s -> %s", cmd, "ACK" if ok else "NAK")
+        # Update the response sensor
+        coordinator.update_last_command_status(ok)
+
 
     hass.services.async_register(DOMAIN, "send_ascii_setting", send_ascii_setting)
 
@@ -51,7 +94,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    # Unload platforms
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    
     if unload_ok:
-        hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+        # Cancel the polling loop
+        listener = hass.data[DOMAIN][entry.entry_id].get("update_listener")
+        if listener:
+            listener() # This cancels the listener
+        
+        # Clean up the coordinator and other data
+        isolar = hass.data[DOMAIN][entry.entry_id]["coordinator"]._isolar
+        if isolar:
+            await isolar.client.stop()
+        
+        hass.data[DOMAIN].pop(entry.entry_id)
+
     return unload_ok
