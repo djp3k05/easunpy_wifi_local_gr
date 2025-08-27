@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from .const import DOMAIN
 from homeassistant.core import HomeAssistant, ServiceCall
 import homeassistant.helpers.config_validation as cv
 import logging
@@ -16,7 +15,9 @@ import asyncio
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.SENSOR]
+DOMAIN = "easun_inverter"
+
+PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.SELECT, Platform.NUMBER, Platform.BUTTON]
 CONFIG_SCHEMA = cv.config_entry_only_config_schema("easun_inverter")
 
 async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
@@ -108,7 +109,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register services and forward setup
     hass.services.async_register(DOMAIN, "register_scan", handle_register_scan)
     hass.services.async_register(DOMAIN, "device_scan", handle_device_scan)
-    await hass.config_entries.async_forward_entry_setups(entry, [Platform.SENSOR])
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -121,7 +122,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
             await coordinator._isolar.client._cleanup_server()
             _LOGGER.debug("Cleaned up modbus client connection")
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, [Platform.SENSOR])
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok and entry.entry_id in hass.data[DOMAIN]:
         _LOGGER.debug("Removing entry data")
         hass.data[DOMAIN].pop(entry.entry_id)

@@ -25,10 +25,12 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
 
 from . import DOMAIN
-from .const import DEFAULT_SCAN_INTERVAL
 from easunpy.async_isolar import AsyncISolar
 
 _LOGGER = logging.getLogger(__name__)
+
+DEFAULT_SCAN_INTERVAL = 30  # seconds
+
 
 class DataCollector:
     """Centralized data collector for Easun Inverter."""
@@ -48,6 +50,11 @@ class DataCollector:
     def register_sensor(self, sensor: SensorEntity) -> None:
         self._sensors.append(sensor)
         _LOGGER.debug(f"Registered sensor: {sensor.name}")
+
+    # Allow non-sensor control entities (select/number/button) to register for updates
+    def register_entity(self, entity: SensorEntity) -> None:
+        self._sensors.append(entity)
+        _LOGGER.debug(f"Registered entity: {getattr(entity, 'name', type(entity).__name__)}")
 
     async def is_update_stuck(self) -> bool:
         if self._last_update_start is None:
@@ -100,8 +107,6 @@ class DataCollector:
 class EasunSensor(SensorEntity):
     """Representation of an Easun Inverter sensor."""
 
-    _attr_should_poll = False
-
     def __init__(
         self,
         data_collector: DataCollector,
@@ -149,11 +154,6 @@ class EasunSensor(SensorEntity):
         if self._converter and value is not None:
             value = self._converter(value)
         self._state = value
-        # Push state to Home Assistant immediately
-        try:
-            self.async_write_ha_state()
-        except Exception:
-            pass
 
 
 class RegisterScanSensor(SensorEntity):
