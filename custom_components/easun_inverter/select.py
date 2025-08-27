@@ -17,7 +17,7 @@ from .sensor import DataCollector
 
 _LOGGER = logging.getLogger(__name__)
 
-# Static option sets (labels are the same ones we show in sensors from QPIRI)
+# Static option sets
 POP_OPTIONS: Final[list[str]] = ["UtilitySolarBat", "SolarUtilityBat", "SolarBatUtility"]
 PCP_OPTIONS: Final[list[str]] = ["Solar first", "Solar + Utility", "Only solar charging"]
 PGR_OPTIONS: Final[list[str]] = ["Appliance", "UPS"]
@@ -31,6 +31,8 @@ POPM_OPTIONS: Final[list[str]] = [
     "Phase 2 of 2 Phase output (120°)",
     "Phase 2 of 2 Phase output (180°)",
 ]
+MAX_CHARGING_CURRENT_OPTIONS: Final[list[str]] = [str(i) for i in range(10, 121, 10)]
+MAX_UTILITY_CHARGING_CURRENT_OPTIONS: Final[list[str]] = ['2'] + [str(i) for i in range(10, 121, 10)]
 
 
 class _BaseSelect(SelectEntity):
@@ -59,14 +61,14 @@ class _BaseSelect(SelectEntity):
 
     @property
     def current_option(self) -> Optional[str]:
-        # Read the latest value directly from the coordinator's data store
         value = self._coordinator.get_data("system", self._key)
-        if value in self._options:
-            self._attr_current_option = value
+        # Convert value to string for consistent comparison
+        s_value = str(value) if value is not None else None
+        if s_value in self._options:
+            self._attr_current_option = s_value
         return self._attr_current_option
 
     async def _get_isolar(self):
-        # Get isolar and coordinator directly
         return self._coordinator._isolar, self._coordinator
 
     def update_from_collector(self) -> None:
@@ -83,12 +85,11 @@ class OutputSourcePrioritySelect(_BaseSelect):
 
     async def async_select_option(self, option: str) -> None:
         isolar, coord = await self._get_isolar()
-        if not isolar:
-            return
+        if not isolar: return
         ok = await isolar.set_output_source_priority(option)
+        coord.update_last_command_status(ok)
         _LOGGER.info("Set Output Source Priority -> %s", ok)
-        if ok:
-            await coord.update_data()
+        if ok: await coord.update_data()
 
 
 class ChargerSourcePrioritySelect(_BaseSelect):
@@ -97,12 +98,11 @@ class ChargerSourcePrioritySelect(_BaseSelect):
 
     async def async_select_option(self, option: str) -> None:
         isolar, coord = await self._get_isolar()
-        if not isolar:
-            return
+        if not isolar: return
         ok = await isolar.set_charger_source_priority(option)
+        coord.update_last_command_status(ok)
         _LOGGER.info("Set Charger Source Priority -> %s", ok)
-        if ok:
-            await coord.update_data()
+        if ok: await coord.update_data()
 
 
 class GridWorkingRangeSelect(_BaseSelect):
@@ -111,12 +111,11 @@ class GridWorkingRangeSelect(_BaseSelect):
 
     async def async_select_option(self, option: str) -> None:
         isolar, coord = await self._get_isolar()
-        if not isolar:
-            return
+        if not isolar: return
         ok = await isolar.set_grid_working_range(option)
+        coord.update_last_command_status(ok)
         _LOGGER.info("Set Grid Working Range -> %s", ok)
-        if ok:
-            await coord.update_data()
+        if ok: await coord.update_data()
 
 
 class OutputModeSelect(_BaseSelect):
@@ -124,28 +123,46 @@ class OutputModeSelect(_BaseSelect):
         super().__init__(coordinator, "Output Mode (QPIRI)", "output_mode_qpiri", POPM_OPTIONS)
 
     async def async_select_option(self, option: str) -> None:
-        # Map friendly -> protocol code via the same mapping as parser uses
         mapping = {
-            "Single machine output": "single",
-            "Parallel output": "parallel",
-            "Phase 1 of 3 Phase output": "p1_3ph",
-            "Phase 2 of 3 Phase output": "p2_3ph",
-            "Phase 3 of 3 Phase output": "p3_3ph",
-            "Phase 1 of 2 Phase output": "p1_2ph",
-            "Phase 2 of 2 Phase output (120°)": "p2_2ph_120",
-            "Phase 2 of 2 Phase output (180°)": "p2_2ph_180",
+            "Single machine output": "single", "Parallel output": "parallel",
+            "Phase 1 of 3 Phase output": "p1_3ph", "Phase 2 of 3 Phase output": "p2_3ph",
+            "Phase 3 of 3 Phase output": "p3_3ph", "Phase 1 of 2 Phase output": "p1_2ph",
+            "Phase 2 of 2 Phase output (120°)": "p2_2ph_120", "Phase 2 of 2 Phase output (180°)": "p2_2ph_180",
         }
         isolar, coord = await self._get_isolar()
-        if not isolar:
-            return
+        if not isolar: return
         ok = await isolar.set_output_mode(mapping[option])
+        coord.update_last_command_status(ok)
         _LOGGER.info("Set Output Mode -> %s", ok)
-        if ok:
-            await coord.update_data()
+        if ok: await coord.update_data()
+
+# NEW ENTITIES
+class MaxChargingCurrentSelect(_BaseSelect):
+    def __init__(self, coordinator: DataCollector):
+        super().__init__(coordinator, "Max Charging Current", "max_charging_current", MAX_CHARGING_CURRENT_OPTIONS)
+
+    async def async_select_option(self, option: str) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar: return
+        ok = await isolar.set_max_charging_current(int(option))
+        coord.update_last_command_status(ok)
+        _LOGGER.info("Set Max Charging Current -> %s", ok)
+        if ok: await coord.update_data()
+
+class MaxUtilityChargingCurrentSelect(_BaseSelect):
+    def __init__(self, coordinator: DataCollector):
+        super().__init__(coordinator, "Max Utility Charging Current", "max_ac_charging_current", MAX_UTILITY_CHARGING_CURRENT_OPTIONS)
+
+    async def async_select_option(self, option: str) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar: return
+        ok = await isolar.set_max_utility_charging_current(int(option))
+        coord.update_last_command_status(ok)
+        _LOGGER.info("Set Max Utility Charging Current -> %s", ok)
+        if ok: await coord.update_data()
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, add_entities: AddEntitiesCallback) -> None:
-    # Get the coordinator for this config entry
     coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
     
     entities: list[SelectEntity] = [
@@ -153,6 +170,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, add_entitie
         ChargerSourcePrioritySelect(coordinator),
         GridWorkingRangeSelect(coordinator),
         OutputModeSelect(coordinator),
+        MaxChargingCurrentSelect(coordinator),
+        MaxUtilityChargingCurrentSelect(coordinator),
     ]
     add_entities(entities)
     _LOGGER.debug("Select entities added")
