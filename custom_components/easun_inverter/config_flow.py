@@ -6,7 +6,6 @@ from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.core import callback
 import logging
-from datetime import timedelta
 
 from . import DOMAIN
 from .const import DEFAULT_SCAN_INTERVAL
@@ -38,13 +37,17 @@ class EasunInverterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             scan_interval = user_input.get("scan_interval", DEFAULT_SCAN_INTERVAL)
             model = user_input["model"]
 
-            _LOGGER.debug(f"Processing user input: IP={inverter_ip}, model={model}, interval={scan_interval}")
+            _LOGGER.debug(
+                "Processing user input: IP=%s, model=%s, interval=%s",
+                inverter_ip,
+                model,
+                scan_interval,
+            )
 
             if not inverter_ip or not local_ip:
                 errors["base"] = "missing_ip"
             else:
-                # Create the entry, storing only inverter settings in data,
-                # and the polling interval in options so it can be reloaded cleanly.
+                # Store inverter settings in data, polling interval in options.
                 return self.async_create_entry(
                     title=f"Easun Inverter ({inverter_ip})",
                     data={
@@ -81,13 +84,12 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
     """Handle options."""
 
     def __init__(self, config_entry):
-        """Initialize options flow."""
         self.config_entry = config_entry
 
     async def async_step_init(self, user_input=None) -> FlowResult:
         """Manage the options."""
         if user_input is not None:
-            _LOGGER.debug(f"Updating scan_interval to {user_input['scan_interval']} seconds")
+            _LOGGER.debug("Updating scan_interval to %s seconds", user_input["scan_interval"])
 
             # Update only the scan_interval option
             self.hass.config_entries.async_update_entry(
