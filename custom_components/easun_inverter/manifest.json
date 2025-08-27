@@ -1,12 +1,12 @@
 {
   "domain": "easun_inverter",
   "name": "Easun ISolar Inverter GR",
-  "codeowners": ["@vgsolar2"],
+  "codeowners": ["@djp3k05"],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/djp3k05/Easun-Local-Wifi",
+  "documentation": "https://github.com/djp3k05/easunpy_wifi_local_gr",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/djp3k05/Easun-Local-Wifi/issues",
+  "issue_tracker": "https://github.com/djp3k05/easunpy_wifi_local_gr/issues",
   "requirements": [
     "dataclasses>=0.6",
     "git+https://github.com/djp3k05/easunpy_wifi_local_gr.git@main#egg=easunpy",
