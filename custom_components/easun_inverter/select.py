@@ -38,9 +38,8 @@ MAX_UTILITY_CHARGING_CURRENT_OPTIONS: Final[list[str]] = ['2'] + [str(i) for i i
 class _BaseSelect(SelectEntity):
     _attr_should_poll = False
 
-    def __init__(self, coordinator: DataCollector, name: str, key: str, options: list[str], decoder=None):
+    def __init__(self, coordinator: DataCollector, name: str, key: str, options: list[str]):
         self._coordinator = coordinator
-        self._decode = decoder
         self._attr_name = name
         self._attr_unique_id = f"easun_select_{key}"
         self._options = options
@@ -63,50 +62,18 @@ class _BaseSelect(SelectEntity):
     @property
     def current_option(self) -> Optional[str]:
         value = self._coordinator.get_data("system", self._key)
-        label = None
-        if getattr(self, '_decode', None):
-            try:
-                label = self._decode(value)
-            except Exception:
-                label = None
-        if label is None:
-            label = self._default_decode(value)
-        if label in self._options:
-            self._attr_current_option = label
+        # Convert value to string for consistent comparison
+        s_value = str(value) if value is not None else None
+        if s_value in self._options:
+            self._attr_current_option = s_value
         return self._attr_current_option
 
     async def _get_isolar(self):
         return self._coordinator._isolar, self._coordinator
 
-    def _default_decode(self, value) -> Optional[str]:
-        if value is None:
-            return None
-        s = str(value)
-        try:
-            f = float(value)
-            if f.is_integer():
-                s_int = str(int(f))
-                if hasattr(self, '_options') and s_int in self._options:
-                    return s_int
-        except Exception:
-            pass
-        if hasattr(self, '_options'):
-            for cand in (s, s.rstrip('0').rstrip('.')):
-                if cand in self._options:
-                    return cand
-                if cand + 'A' in self._options:
-                    return cand + 'A'
-        return None
-
     def update_from_collector(self) -> None:
         """Called by the coordinator when data is updated."""
         self.async_write_ha_state()
-
-    async def async_added_to_hass(self) -> None:
-        try:
-            self.async_write_ha_state()
-        except Exception:
-            pass
 
     async def async_select_option(self, option: str) -> None:
         raise NotImplementedError
@@ -152,44 +119,8 @@ class GridWorkingRangeSelect(_BaseSelect):
 
 
 class OutputModeSelect(_BaseSelect):
-    @staticmethod
-    def _decode_output_mode(value) -> Optional[str]:
-        if value is None:
-            return None
-        friendly = {
-            "Single machine output",
-            "Parallel output",
-            "Phase 1 of 3 Phase output",
-            "Phase 2 of 3 Phase output",
-            "Phase 3 of 3 Phase output",
-            "Phase 1 of 2 Phase output",
-            "Phase 2 of 2 Phase output (120°)",
-            "Phase 2 of 2 Phase output (180°)",
-        }
-        if str(value) in friendly:
-            return str(value)
-        code_map = {
-            "00": "Single machine output",
-            "01": "Parallel output",
-            "02": "Phase 1 of 3 Phase output",
-            "03": "Phase 2 of 3 Phase output",
-            "04": "Phase 3 of 3 Phase output",
-            "05": "Phase 1 of 2 Phase output",
-            "06": "Phase 2 of 2 Phase output (120°)",
-            "07": "Phase 2 of 2 Phase output (180°)",
-            "single": "Single machine output",
-            "parallel": "Parallel output",
-            "p1_3ph": "Phase 1 of 3 Phase output",
-            "p2_3ph": "Phase 2 of 3 Phase output",
-            "p3_3ph": "Phase 3 of 3 Phase output",
-            "p1_2ph": "Phase 1 of 2 Phase output",
-            "p2_2ph_120": "Phase 2 of 2 Phase output (120°)",
-            "p2_2ph_180": "Phase 2 of 2 Phase output (180°)",
-        }
-        return code_map.get(str(value))
-
     def __init__(self, coordinator: DataCollector):
-        super().__init__(coordinator, "Output Mode (QPIRI)", "output_mode_qpiri", POPM_OPTIONS, decoder=OutputModeSelect._decode_output_mode)
+        super().__init__(coordinator, "Output Mode (QPIRI)", "output_mode_qpiri", POPM_OPTIONS)
 
     async def async_select_option(self, option: str) -> None:
         mapping = {
@@ -208,7 +139,7 @@ class OutputModeSelect(_BaseSelect):
 # NEW ENTITIES
 class MaxChargingCurrentSelect(_BaseSelect):
     def __init__(self, coordinator: DataCollector):
-        super().__init__(coordinator, "Max Charging Current", "max_charging_current", MAX_CHARGING_CURRENT_OPTIONS, decoder=lambda v: (str(int(float(v))) if v is not None else None))
+        super().__init__(coordinator, "Max Charging Current", "max_charging_current", MAX_CHARGING_CURRENT_OPTIONS)
 
     async def async_select_option(self, option: str) -> None:
         isolar, coord = await self._get_isolar()
@@ -220,7 +151,7 @@ class MaxChargingCurrentSelect(_BaseSelect):
 
 class MaxUtilityChargingCurrentSelect(_BaseSelect):
     def __init__(self, coordinator: DataCollector):
-        super().__init__(coordinator, "Max Utility Charging Current", "max_ac_charging_current", MAX_UTILITY_CHARGING_CURRENT_OPTIONS, decoder=lambda v: (str(int(float(v))) if v is not None else None))
+        super().__init__(coordinator, "Max Utility Charging Current", "max_ac_charging_current", MAX_UTILITY_CHARGING_CURRENT_OPTIONS)
 
     async def async_select_option(self, option: str) -> None:
         isolar, coord = await self._get_isolar()
