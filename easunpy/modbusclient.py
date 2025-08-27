@@ -4,7 +4,7 @@ import struct
 import time
 import logging  # Import logging
 
-from easunpy.crc import crc16_modbus, crc16_xmodem, adjust_crc_byte
+from .crc import crc16_modbus, crc16_xmodem, adjust_crc_byte
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)

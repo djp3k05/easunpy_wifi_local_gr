@@ -59,6 +59,7 @@ class OperatingMode(Enum):
     FAULT = 0
     SUB = 2
     SBU = 3
+    IDLE = 4 # Added for standby mode from QMOD
 
 # -------------------------
 # “System / device” data
