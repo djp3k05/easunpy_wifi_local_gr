@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
+import asyncio
+from datetime import datetime
+import contextlib
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
@@ -26,7 +29,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from . import DOMAIN
 
 if TYPE_CHECKING:
-    from .easunpy.async_isolar import AsyncISolar
+    # ** THE FIX IS HERE: Using the full import path **
+    from custom_components.easun_inverter.easunpy.async_isolar import AsyncISolar
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -53,12 +57,10 @@ class DataCollector:
     async def is_update_stuck(self) -> bool:
         if self._last_update_start is None:
             return False
-        from datetime import datetime
         elapsed = (datetime.now() - self._last_update_start).total_seconds()
         return elapsed > 30
 
     def update_last_command_status(self, success: bool):
-        from datetime import datetime
         status = "Success" if success else "Fail"
         timestamp = datetime.now().strftime('%H:%M:%S')
         
@@ -74,10 +76,6 @@ class DataCollector:
                 break
 
     async def update_data(self) -> None:
-        from datetime import datetime
-        import contextlib
-        import asyncio
-
         if self._lock.locked():
             _LOGGER.warning("Previous update still in progress, skipping")
             return
