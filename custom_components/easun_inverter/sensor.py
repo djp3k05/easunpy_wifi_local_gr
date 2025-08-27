@@ -1,369 +1,325 @@
-# easun_inverter/sensor.py
-
-"""Support for Easun Inverter sensors."""
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
+from typing import Any, Iterable, Optional
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (
-    UnitOfPower,
-    UnitOfElectricCurrent,
-    UnitOfElectricPotential,
-    UnitOfTemperature,
-    UnitOfFrequency,
-    UnitOfApparentPower,
-    UnitOfEnergy,
-    PERCENTAGE,
-)
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.dispatcher import async_dispatcher_send, async_dispatcher_connect
 from homeassistant.helpers.event import async_track_time_interval
 
-from . import DOMAIN
 from easunpy.async_isolar import AsyncISolar
+
+from .const import (
+    DOMAIN,
+    CONF_INVERTER_IP,
+    CONF_LOCAL_IP,
+    CONF_MODEL,
+    CONF_SCAN_INTERVAL,
+    DEFAULT_SCAN_INTERVAL,
+    SIGNAL_COLLECTOR_UPDATED,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-DEFAULT_SCAN_INTERVAL = 30  # seconds
+
+# ---- helpers: read attr OR dict key; plus describe for debug ----
+def _get(obj: Any, keys: Iterable[str]) -> Any:
+    """Return first non-None value among attribute-or-key candidates."""
+    if obj is None:
+        return None
+    for k in keys:
+        if hasattr(obj, k):
+            v = getattr(obj, k)
+            if v is not None:
+                return v
+        if isinstance(obj, dict) and k in obj and obj[k] is not None:
+            return obj[k]
+    return None
+
+
+def _describe_obj(obj: Any) -> str:
+    if obj is None:
+        return "None"
+    try:
+        if isinstance(obj, dict):
+            ks = list(obj.keys())
+            return f"dict keys={ks[:25]}{'…' if len(ks) > 25 else ''}"
+        # dataclass or other object: list public attrs
+        attrs = [a for a in dir(obj) if not a.startswith("_") and not callable(getattr(obj, a, None))]
+        return f"{type(obj).__name__} attrs={attrs[:25]}{'…' if len(attrs) > 25 else ''}"
+    except Exception as e:  # noqa: BLE001
+        return f"{type(obj).__name__} (describe error: {e})"
+
+
+class FG:
+    """Field getter callable used by sensors; also carries meta for logging & availability."""
+    __slots__ = ("src_attr", "keys", "name")
+
+    def __init__(self, src_attr: str, *keys: str, name: str = ""):
+        self.src_attr = src_attr
+        self.keys = keys
+        self.name = name  # optional human name for debug
+
+    def __call__(self, collector: "DataCollector"):
+        obj = getattr(collector, self.src_attr, None)
+        return _get(obj, self.keys)
 
 
 class DataCollector:
-    """Centralized data collector for Easun Inverter."""
+    """Owns the AsyncISolar client and caches the last reading for other platforms."""
 
-    def __init__(self, isolar: AsyncISolar):
-        self._isolar = isolar
-        self._data: dict = {}
-        self._lock = asyncio.Lock()
-        self._consecutive_failures = 0
-        self._max_consecutive_failures = 5
-        self._last_update_start: datetime | None = None
-        self._last_successful_update: datetime | None = None
-        self._update_timeout = 30
-        self._entities: list[Entity] = []
-        _LOGGER.info(f"DataCollector initialized with model: {self._isolar.model}")
+    def __init__(self, hass: HomeAssistant, inverter_ip: str, local_ip: str, model: str, scan_interval: int) -> None:
+        self.hass = hass
+        self.isolar = AsyncISolar(inverter_ip, local_ip, model=model)
+        self.scan_interval = max(2, int(scan_interval or DEFAULT_SCAN_INTERVAL))
 
-    def register_entity(self, entity: Entity) -> None:
-        self._entities.append(entity)
-        _LOGGER.debug(f"Registered entity: {entity.name}")
+        # These can be dataclasses OR dicts depending on easunpy version
+        self.last_battery: Optional[Any] = None
+        self.last_pv: Optional[Any] = None
+        self.last_grid: Optional[Any] = None
+        self.last_output: Optional[Any] = None
+        self.last_status: Optional[Any] = None
 
-    async def is_update_stuck(self) -> bool:
-        if self._last_update_start is None:
-            return False
-        elapsed = (datetime.now() - self._last_update_start).total_seconds()
-        return elapsed > self._update_timeout
+        self._task_unsub = None
+        self._updating = False
+        self._dumped_once = False  # only log one deep snapshot
 
-    def update_last_command_status(self, success: bool):
-        """Update the status of the last sent command."""
-        status = "Success" if success else "Fail"
-        timestamp = datetime.now().strftime('%H:%M:%S')
-        
-        # Ensure the system dictionary exists
-        if "system" not in self._data:
-            self._data["system"] = {}
-            
-        self._data["system"]["last_command_response"] = f"{status} @ {timestamp}"
-        
-        # Manually trigger an update for the response sensor
-        for entity in self._entities:
-            # The key is a custom attribute we add to the sensor to identify it
-            if hasattr(entity, '_key') and entity._key == 'last_command_response':
-                if hasattr(entity, 'update_from_collector'):
-                    entity.update_from_collector()
-                # Schedule the state update in the event loop
-                if entity.hass:
-                    entity.async_schedule_update_ha_state(True)
-                break
+        _LOGGER.info("DataCollector initialized with model: %s", model)
 
-    async def update_data(self) -> None:
-        if self._lock.locked():
-            _LOGGER.warning("Previous update still in progress, skipping")
+    async def start(self) -> None:
+        if self._task_unsub is None:
+            self._task_unsub = async_track_time_interval(
+                self.hass, self._scheduled_update, timedelta(seconds=self.scan_interval)
+            )
+        # Also trigger an immediate poll for initial values
+        await self.async_poll_once()
+
+    async def stop(self) -> None:
+        if self._task_unsub:
+            self._task_unsub()
+            self._task_unsub = None
+
+    async def async_poll_once(self) -> None:
+        if self._updating:
+            _LOGGER.debug("Previous update still in progress, skipping")
             return
-
-        await self._lock.acquire()
+        self._updating = True
+        _LOGGER.debug("Starting data collector update")
         try:
-            update_task = asyncio.create_task(self._do_update())
-            try:
-                await asyncio.wait_for(update_task, timeout=self._update_timeout)
-                for entity in self._entities:
-                    if hasattr(entity, 'update_from_collector'):
-                        # Don't update the response sensor during normal polling
-                        if not (hasattr(entity, '_key') and entity._key == 'last_command_response'):
-                             entity.update_from_collector()
-                _LOGGER.debug("Updated all registered entities")
-                self._last_successful_update = datetime.now()
-                self._consecutive_failures = 0
-            except asyncio.TimeoutError:
-                _LOGGER.error("Data update timed out, cancelling")
-                update_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await update_task
-            except Exception as e:
-                _LOGGER.error(f"Error during data update: {e}")
-                self._consecutive_failures += 1
-                if self._consecutive_failures >= self._max_consecutive_failures:
-                    _LOGGER.critical(
-                        f"Max consecutive failures reached ({self._max_consecutive_failures})"
+            batt, pv, grid, out, status = await self.isolar.get_all_data()
+            got_any = any(x is not None for x in (batt, pv, grid, out, status))
+            if got_any:
+                if batt is not None:
+                    self.last_battery = batt
+                if pv is not None:
+                    self.last_pv = pv
+                if grid is not None:
+                    self.last_grid = grid
+                if out is not None:
+                    self.last_output = out
+                if status is not None:
+                    self.last_status = status
+
+                # One-time deep snapshot so we know exactly what's inside
+                if not self._dumped_once:
+                    _LOGGER.debug(
+                        "Snapshot shapes: battery=%s | pv=%s | grid=%s | output=%s | status=%s",
+                        _describe_obj(self.last_battery),
+                        _describe_obj(self.last_pv),
+                        _describe_obj(self.last_grid),
+                        _describe_obj(self.last_output),
+                        _describe_obj(self.last_status),
                     )
+                    # Sample a few values to confirm mapping
+                    sample_batt_v = _get(self.last_battery, ("voltage", "battery_voltage"))
+                    sample_out_w = _get(self.last_output, ("power", "ac_output_active_power", "output_active_power"))
+                    sample_mode = _get(self.last_status, ("mode_name", "operating_mode"))
+                    _LOGGER.debug(
+                        "Sample values: BatteryVoltage=%s | OutputPower=%s | OperatingMode=%s",
+                        sample_batt_v, sample_out_w, sample_mode,
+                    )
+                    self._dumped_once = True
+
+                async_dispatcher_send(self.hass, SIGNAL_COLLECTOR_UPDATED)
+                _LOGGER.debug("Updated all registered sensors")
+            else:
+                _LOGGER.debug("Parsed response returned no data objects this cycle")
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.error("Error during data update: %s", getattr(exc, "args", [""])[0])
         finally:
-            self._lock.release()
+            _LOGGER.debug("Data collector update finished")
+            self._updating = False
 
-    async def _do_update(self) -> None:
-        battery, pv, grid, output, status = await self._isolar.get_all_data()
-        self._data["battery"] = battery.__dict__ if battery else {}
-        self._data["pv"] = pv.__dict__ if pv else {}
-        self._data["grid"] = grid.__dict__ if grid else {}
-        self._data["output"] = output.__dict__ if output else {}
-        self._data["system"] = status.__dict__ if status else {}
-        # Preserve last command response across updates if it exists
-        last_response = self._data.get("system", {}).get("last_command_response")
-        if last_response:
-            if "system" not in self._data: self._data["system"] = {}
-            self._data["system"]["last_command_response"] = last_response
+    async def _scheduled_update(self, _now) -> None:
+        await self.async_poll_once()
 
 
-    def get_data(self, section: str, key: str):
-        return self._data.get(section, {}).get(key)
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities) -> None:
+    scan_interval = entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+    inverter_ip = entry.data[CONF_INVERTER_IP]
+    local_ip = entry.data[CONF_LOCAL_IP]
+    model = entry.data.get(CONF_MODEL, "VOLTRONIC_ASCII")
+
+    group = hass.data.setdefault(DOMAIN, {})
+    collector: DataCollector = group.get(entry.entry_id)
+    if collector is None:
+        collector = DataCollector(hass, inverter_ip, local_ip, model, scan_interval)
+        group[entry.entry_id] = collector
+        await collector.start()
+    _LOGGER.debug("Setting up entry with scan_interval: %s", scan_interval)
+
+    entities: list[SensorEntity] = []
+
+    def add(name: str, icon: str, unit: Optional[str], getter: FG):
+        getter.name = name
+        entities.append(GenericSensor(entry.entry_id, collector, name, icon, unit, getter))
+
+    # Battery
+    add("Battery Voltage", "mdi:car-battery", "V", FG("last_battery", "voltage", "battery_voltage"))
+    add("Battery Current", "mdi:current-dc", "A", FG("last_battery", "current", "battery_current"))
+    add("Battery Power", "mdi:flash", "W", FG("last_battery", "power", "battery_power"))
+    add("Battery SoC", "mdi:battery-high", "%", FG("last_battery", "soc", "battery_capacity", "battery_soc"))
+    add("Inverter Temperature", "mdi:thermometer", "°C", FG("last_battery", "temperature", "inverter_temperature"))
+    add("Battery Charge Current", "mdi:current-dc", "A", FG("last_battery", "charge_current", "battery_charging_current"))
+    add("Battery Discharge Current", "mdi:current-dc", "A", FG("last_battery", "discharge_current", "battery_discharge_current"))
+    add("Battery Voltage (SCC)", "mdi:car-battery", "V", FG("last_battery", "voltage_scc", "battery_voltage_from_scc"))
+    add("Battery Voltage Offset for Fans", "mdi:fan", None, FG("last_battery", "voltage_offset_for_fans"))
+    add("EEPROM Version", "mdi:chip", None, FG("last_battery", "eeprom_version"))
+
+    # PV
+    add("PV Total Power", "mdi:solar-power", "W", FG("last_pv", "total_power", "pv_total_power"))
+    add("PV Charging Power", "mdi:solar-power", "W", FG("last_pv", "charging_power", "pv_charging_power"))
+    add("PV Charging Current", "mdi:current-dc", "A", FG("last_pv", "charging_current", "pv_charging_current"))
+    add("PV1 Voltage", "mdi:solar-panel", "V", FG("last_pv", "pv1_voltage"))
+    add("PV1 Current", "mdi:current-dc", "A", FG("last_pv", "pv1_current"))
+    add("PV1 Power", "mdi:solar-power", "W", FG("last_pv", "pv1_power"))
+    add("PV2 Voltage", "mdi:solar-panel", "V", FG("last_pv", "pv2_voltage"))
+    add("PV2 Current", "mdi:current-dc", "A", FG("last_pv", "pv2_current"))
+    add("PV2 Power", "mdi:solar-power", "W", FG("last_pv", "pv2_power"))
+    add("PV Generated Today", "mdi:counter", None, FG("last_pv", "pv_generated_today", "pv_today"))
+    add("PV Generated Total", "mdi:counter", None, FG("last_pv", "pv_generated_total", "pv_total"))
+
+    # Grid
+    add("Grid Voltage", "mdi:transmission-tower", "V", FG("last_grid", "voltage", "grid_voltage"))
+    add("Grid Power", "mdi:flash", "W", FG("last_grid", "power", "grid_power"))
+    add("Grid Frequency", "mdi:sine-wave", "Hz", FG("last_grid", "frequency", "grid_frequency"))
+
+    # Output
+    add("Output Voltage", "mdi:power-socket-eu", "V", FG("last_output", "voltage", "ac_output_voltage", "output_voltage"))
+    add("Output Current", "mdi:current-ac", "A", FG("last_output", "current", "output_current"))
+    add("Output Power", "mdi:flash", "W", FG("last_output", "power", "ac_output_active_power", "output_active_power"))
+    add("Output Apparent Power", "mdi:flash", "VA", FG("last_output", "apparent_power", "ac_output_apparent_power", "output_apparent_power"))
+    add("Output Load Percentage", "mdi:percent", "%", FG("last_output", "load_percentage", "output_load_percent"))
+    add("Output Frequency", "mdi:sine-wave", "Hz", FG("last_output", "frequency", "ac_output_frequency", "output_frequency"))
+
+    # System status + QPIRI (settings snapshot)
+    add("Operating Mode", "mdi:power-settings", None, FG("last_status", "mode_name", "operating_mode"))
+    add("Inverter Time", "mdi:clock-outline", None, FG("last_status", "inverter_time"))
+    add("Bus Voltage", "mdi:resistor", "V", FG("last_status", "bus_voltage"))
+    add("Device Status Flags", "mdi:flag-outline", None, FG("last_status", "device_status_flags"))
+    add("Device Status 2 Flags", "mdi:flag-outline", None, FG("last_status", "device_status_flags2"))
+    add("Warnings", "mdi:alert-outline", None, FG("last_status", "warnings"))
+
+    add("Grid Rating Voltage", "mdi:alpha-g-circle", "V", FG("last_status", "grid_rating_voltage"))
+    add("Grid Rating Current", "mdi:alpha-g-circle", "A", FG("last_status", "grid_rating_current"))
+    add("AC Output Rating Voltage", "mdi:alpha-a-circle", "V", FG("last_status", "ac_output_rating_voltage"))
+    add("AC Output Rating Frequency", "mdi:alpha-a-circle", "Hz", FG("last_status", "ac_output_rating_frequency"))
+    add("AC Output Rating Current", "mdi:alpha-a-circle", "A", FG("last_status", "ac_output_rating_current"))
+    add("AC Output Rating Apparent Power", "mdi:alpha-a-circle", "VA", FG("last_status", "ac_output_rating_apparent_power"))
+    add("AC Output Rating Active Power", "mdi:alpha-a-circle", "W", FG("last_status", "ac_output_rating_active_power"))
+    add("Battery Rating Voltage", "mdi:alpha-b-circle", "V", FG("last_status", "battery_rating_voltage"))
+    add("Battery Re-Charge Voltage", "mdi:alpha-b-circle", "V", FG("last_status", "battery_recharge_voltage"))
+    add("Battery Under Voltage", "mdi:alpha-b-circle", "V", FG("last_status", "battery_undervoltage"))
+    add("Battery Bulk Voltage", "mdi:alpha-b-circle", "V", FG("last_status", "battery_bulk_voltage"))
+    add("Battery Float Voltage", "mdi:alpha-b-circle", "V", FG("last_status", "battery_float_voltage"))
+    add("Battery Type", "mdi:car-battery", None, FG("last_status", "battery_type"))
+    add("Max AC Charging Current", "mdi:alpha-m-circle", "A", FG("last_status", "max_ac_charging_current"))
+    add("Max Charging Current", "mdi:alpha-m-circle", "A", FG("last_status", "max_charging_current"))
+    add("Input Voltage Range", "mdi:alpha-i-circle", None, FG("last_status", "input_voltage_range"))
+    add("Output Source Priority", "mdi:alpha-o-circle", None, FG("last_status", "output_source_priority"))
+    add("Charger Source Priority", "mdi:alpha-c-circle", None, FG("last_status", "charger_source_priority"))
+    add("Parallel Max Num", "mdi:alpha-p-circle", None, FG("last_status", "parallel_max_num"))
+    add("Machine Type", "mdi:cog", None, FG("last_status", "machine_type"))
+    add("Topology", "mdi:vector-triangle", None, FG("last_status", "topology"))
+    add("Output Mode (QPIRI)", "mdi:alpha-o-circle", None, FG("last_status", "output_mode_qpiri"))
+    add("Battery Re-Discharge Voltage", "mdi:alpha-b-circle", "V", FG("last_status", "battery_redischarge_voltage"))
+    add("PV OK Condition", "mdi:solar-power", None, FG("last_status", "pv_ok_condition"))
+    add("PV Power Balance", "mdi:solar-power", None, FG("last_status", "pv_power_balance"))
+    add("Max Charging Time at CV", "mdi:timer", "min", FG("last_status", "max_charging_time_cv"))
+    add("Max Discharging Current", "mdi:current-dc", "A", FG("last_status", "max_discharging_current"))
+
+    async_add_entities(entities)
+    _LOGGER.debug("Easun Inverter sensors added (%d entities)", len(entities))
+
+    # Force one immediate refresh AFTER entities are added so they get their first state
+    await collector.async_poll_once()
 
 
-class EasunSensor(SensorEntity):
-    """Representation of an Easun Inverter sensor."""
+class GenericSensor(SensorEntity):
+    _attr_should_poll = False
 
-    def __init__(
-        self,
-        data_collector: DataCollector,
-        unique_id: str,
-        name: str,
-        unit: str | None,
-        section: str,
-        key: str,
-        converter=None,
-    ):
-        self._collector = data_collector
-        self._unique_id = unique_id
-        self._attr_name = name
+    def __init__(self, entry_id: str, collector: DataCollector, name: str, icon: str, unit: str | None, getter: FG):
+        self._entry_id = entry_id
+        self._collector = collector
+        self._name = name
+        self._icon = icon
         self._unit = unit
-        self._section = section
-        self._key = key
-        self._converter = converter
-        self._state = None
-        self._collector.register_entity(self)
+        self._getter = getter
+        self._unsub = None
+        self._debug_once_logged = False
 
     @property
-    def unique_id(self) -> str:
-        return f"easun_{self._unique_id}"
+    def name(self) -> str:
+        return self._name
 
     @property
-    def state(self):
-        return self._state
+    def icon(self) -> str | None:
+        return self._icon
 
     @property
-    def unit_of_measurement(self) -> str | None:
+    def native_unit_of_measurement(self) -> str | None:
         return self._unit
 
     @property
-    def device_info(self) -> DeviceInfo:
-        return DeviceInfo(
-            identifiers={(DOMAIN, "easun_inverter")},
-            name="Easun Inverter",
-            manufacturer="Easun",
-            model=self._collector._isolar.model,
-            sw_version="1.0",
-        )
-
-    def update_from_collector(self) -> None:
-        value = self._collector.get_data(self._section, self._key)
-        if self._converter and value is not None:
-            value = self._converter(value)
-        self._state = value
-
-
-class RegisterScanSensor(SensorEntity):
-    def __init__(self, hass: HomeAssistant):
-        self._attr_name = "Easun Register Scan"
-        self._attr_unique_id = "easun_register_scan"
-        self._state = None
-        self._hass = hass
+    def available(self) -> bool:
+        """Mark available when the collector has the relevant last_* object set."""
+        src = getattr(self._collector, self._getter.src_attr, None)
+        return src is not None
 
     @property
-    def state(self):
-        return self._state
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        return DeviceInfo(
-            identifiers={(DOMAIN, "easun_inverter")},
-            name="Easun Inverter",
-            manufacturer="Easun",
-        )
-
-    def update(self):
-        scan = self._hass.data.get(DOMAIN, {}).get("register_scan", {})
-        self._state = scan.get("timestamp", "No scan")
-
-
-class DeviceScanSensor(SensorEntity):
-    def __init__(self, hass: HomeAssistant):
-        self._attr_name = "Easun Device Scan"
-        self._attr_unique_id = "easun_device_scan"
-        self._state = None
-        self._hass = hass
-
-    @property
-    def state(self):
-        return self._state
-
-    @property
-    def extra_state_attributes(self):
-        return self._hass.data.get(DOMAIN, {}).get("device_scan")
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        return DeviceInfo(
-            identifiers={(DOMAIN, "easun_inverter")},
-            name="Easun Inverter",
-            manufacturer="Easun",
-        )
-
-    def update(self):
-        scan = self._hass.data.get(DOMAIN, {}).get("device_scan", {})
-        self._state = scan.get("timestamp", "No scan")
-
-
-async def async_setup_entry(
-    hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    add_entities: AddEntitiesCallback,
-) -> None:
-    """Set up the Easun Inverter sensors from a config entry."""
-    entry_id = config_entry.entry_id
-    inverter_ip = config_entry.data["inverter_ip"]
-    local_ip = config_entry.data["local_ip"]
-    model = config_entry.data["model"]
-
-    scan_interval = config_entry.options.get("scan_interval", DEFAULT_SCAN_INTERVAL)
-    _LOGGER.debug(f"Setting up entry with scan_interval: {scan_interval}")
-
-    isolar = AsyncISolar(inverter_ip, local_ip, model)
-    data_collector = DataCollector(isolar)
-
-    hass.data.setdefault(DOMAIN, {})[entry_id] = {"coordinator": data_collector}
-
-    frequency_converter = lambda v: (v / 100) if v is not None else None
-
-    entities: list[SensorEntity] = [
-        # NEW SENSOR
-        EasunSensor(data_collector, "last_command_response", "Last Command Response", None, "system", "last_command_response"),
-
-        # Battery runtime
-        EasunSensor(data_collector, "battery_voltage", "Battery Voltage", UnitOfElectricPotential.VOLT, "battery", "voltage"),
-        EasunSensor(data_collector, "battery_current", "Battery Current", UnitOfElectricCurrent.AMPERE, "battery", "current"),
-        EasunSensor(data_collector, "battery_power", "Battery Power", UnitOfPower.WATT, "battery", "power"),
-        EasunSensor(data_collector, "battery_soc", "Battery SoC", PERCENTAGE, "battery", "soc"),
-        EasunSensor(data_collector, "battery_temperature", "Inverter Temperature", UnitOfTemperature.CELSIUS, "battery", "temperature"),
-        EasunSensor(data_collector, "battery_charge_current", "Battery Charge Current", UnitOfElectricCurrent.AMPERE, "battery", "charge_current"),
-        EasunSensor(data_collector, "battery_discharge_current", "Battery Discharge Current", UnitOfElectricCurrent.AMPERE, "battery", "discharge_current"),
-        EasunSensor(data_collector, "battery_voltage_scc", "Battery Voltage (SCC)", UnitOfElectricPotential.VOLT, "battery", "voltage_scc"),
-        EasunSensor(data_collector, "battery_voltage_offset_fans", "Battery Voltage Offset for Fans", UnitOfElectricPotential.VOLT, "battery", "voltage_offset_for_fans"),
-        EasunSensor(data_collector, "battery_eeprom_version", "EEPROM Version", None, "battery", "eeprom_version"),
-
-        # PV runtime
-        EasunSensor(data_collector, "pv_total_power", "PV Total Power", UnitOfPower.WATT, "pv", "total_power"),
-        EasunSensor(data_collector, "pv_charging_power", "PV Charging Power", UnitOfPower.WATT, "pv", "charging_power"),
-        EasunSensor(data_collector, "pv_charging_current", "PV Charging Current", UnitOfElectricCurrent.AMPERE, "pv", "charging_current"),
-        EasunSensor(data_collector, "pv1_voltage", "PV1 Voltage", UnitOfElectricPotential.VOLT, "pv", "pv1_voltage"),
-        EasunSensor(data_collector, "pv1_current", "PV1 Current", UnitOfElectricCurrent.AMPERE, "pv", "pv1_current"),
-        EasunSensor(data_collector, "pv1_power", "PV1 Power", UnitOfPower.WATT, "pv", "pv1_power"),
-        EasunSensor(data_collector, "pv2_voltage", "PV2 Voltage", UnitOfElectricPotential.VOLT, "pv", "pv2_voltage"),
-        EasunSensor(data_collector, "pv2_current", "PV2 Current", UnitOfElectricCurrent.AMPERE, "pv", "pv2_current"),
-        EasunSensor(data_collector, "pv2_power", "PV2 Power", UnitOfPower.WATT, "pv", "pv2_power"),
-        EasunSensor(data_collector, "pv_energy_today", "PV Generated Today", UnitOfEnergy.KILO_WATT_HOUR, "pv", "pv_generated_today"),
-        EasunSensor(data_collector, "pv_energy_total", "PV Generated Total", UnitOfEnergy.KILO_WATT_HOUR, "pv", "pv_generated_total"),
-
-        # Grid/output runtime
-        EasunSensor(data_collector, "grid_voltage", "Grid Voltage", UnitOfElectricPotential.VOLT, "grid", "voltage"),
-        EasunSensor(data_collector, "grid_power", "Grid Power", UnitOfPower.WATT, "grid", "power"),
-        EasunSensor(data_collector, "grid_frequency", "Grid Frequency", UnitOfFrequency.HERTZ, "grid", "frequency", frequency_converter),
-        EasunSensor(data_collector, "output_voltage", "Output Voltage", UnitOfElectricPotential.VOLT, "output", "voltage"),
-        EasunSensor(data_collector, "output_current", "Output Current", UnitOfElectricCurrent.AMPERE, "output", "current"),
-        EasunSensor(data_collector, "output_power", "Output Power", UnitOfPower.WATT, "output", "power"),
-        EasunSensor(data_collector, "output_apparent_power", "Output Apparent Power", UnitOfApparentPower.VOLT_AMPERE, "output", "apparent_power"),
-        EasunSensor(data_collector, "output_load_percentage", "Output Load Percentage", PERCENTAGE, "output", "load_percentage"),
-        EasunSensor(data_collector, "output_frequency", "Output Frequency", UnitOfFrequency.HERTZ, "output", "frequency", frequency_converter),
-
-        # System/flags/ratings
-        EasunSensor(data_collector, "operating_mode", "Operating Mode", None, "system", "mode_name"),
-        EasunSensor(data_collector, "inverter_time", "Inverter Time", None, "system", "inverter_time"),
-        EasunSensor(data_collector, "bus_voltage", "Bus Voltage", UnitOfElectricPotential.VOLT, "system", "bus_voltage"),
-        EasunSensor(data_collector, "device_status_flags", "Device Status Flags", None, "system", "device_status_flags"),
-        EasunSensor(data_collector, "device_status_flags2", "Device Status 2 Flags", None, "system", "device_status_flags2"),
-        EasunSensor(data_collector, "warnings", "Warnings", None, "system", "warnings"),
-
-        # QPIRI – ratings & settings
-        EasunSensor(data_collector, "grid_rating_voltage", "Grid Rating Voltage", UnitOfElectricPotential.VOLT, "system", "grid_rating_voltage"),
-        EasunSensor(data_collector, "grid_rating_current", "Grid Rating Current", UnitOfElectricCurrent.AMPERE, "system", "grid_rating_current"),
-        EasunSensor(data_collector, "ac_output_rating_voltage", "AC Output Rating Voltage", UnitOfElectricPotential.VOLT, "system", "ac_output_rating_voltage"),
-        EasunSensor(data_collector, "ac_output_rating_frequency", "AC Output Rating Frequency", UnitOfFrequency.HERTZ, "system", "ac_output_rating_frequency"),
-        EasunSensor(data_collector, "ac_output_rating_current", "AC Output Rating Current", UnitOfElectricCurrent.AMPERE, "system", "ac_output_rating_current"),
-        EasunSensor(data_collector, "ac_output_rating_apparent_power", "AC Output Rating Apparent Power", UnitOfApparentPower.VOLT_AMPERE, "system", "ac_output_rating_apparent_power"),
-        EasunSensor(data_collector, "ac_output_rating_active_power", "AC Output Rating Active Power", UnitOfPower.WATT, "system", "ac_output_rating_active_power"),
-        EasunSensor(data_collector, "battery_rating_voltage", "Battery Rating Voltage", UnitOfElectricPotential.VOLT, "system", "battery_rating_voltage"),
-        EasunSensor(data_collector, "battery_recharge_voltage", "Battery Re-Charge Voltage", UnitOfElectricPotential.VOLT, "system", "battery_recharge_voltage"),
-        EasunSensor(data_collector, "battery_undervoltage", "Battery Under Voltage", UnitOfElectricPotential.VOLT, "system", "battery_undervoltage"),
-        EasunSensor(data_collector, "battery_bulk_voltage", "Battery Bulk Voltage", UnitOfElectricPotential.VOLT, "system", "battery_bulk_voltage"),
-        EasunSensor(data_collector, "battery_float_voltage", "Battery Float Voltage", UnitOfElectricPotential.VOLT, "system", "battery_float_voltage"),
-        EasunSensor(data_collector, "battery_type", "Battery Type", None, "system", "battery_type"),
-        EasunSensor(data_collector, "max_ac_charging_current", "Max AC Charging Current", UnitOfElectricCurrent.AMPERE, "system", "max_ac_charging_current"),
-        EasunSensor(data_collector, "max_charging_current", "Max Charging Current", UnitOfElectricCurrent.AMPERE, "system", "max_charging_current"),
-        EasunSensor(data_collector, "input_voltage_range", "Input Voltage Range", None, "system", "input_voltage_range"),
-        EasunSensor(data_collector, "output_source_priority", "Output Source Priority", None, "system", "output_source_priority"),
-        EasunSensor(data_collector, "charger_source_priority", "Charger Source Priority", None, "system", "charger_source_priority"),
-        EasunSensor(data_collector, "parallel_max_num", "Parallel Max Num", None, "system", "parallel_max_num"),
-        EasunSensor(data_collector, "machine_type", "Machine Type", None, "system", "machine_type"),
-        EasunSensor(data_collector, "topology", "Topology", None, "system", "topology"),
-        EasunSensor(data_collector, "output_mode_qpiri", "Output Mode (QPIRI)", None, "system", "output_mode_qpiri"),
-        EasunSensor(data_collector, "battery_redischarge_voltage", "Battery Re-Discharge Voltage", UnitOfElectricPotential.VOLT, "system", "battery_redischarge_voltage"),
-        EasunSensor(data_collector, "pv_ok_condition", "PV OK Condition", None, "system", "pv_ok_condition"),
-        EasunSensor(data_collector, "pv_power_balance", "PV Power Balance", None, "system", "pv_power_balance"),
-        EasunSensor(data_collector, "max_charging_time_cv", "Max Charging Time at CV", None, "system", "max_charging_time_cv"),
-        EasunSensor(data_collector, "max_discharging_current", "Max Discharging Current", UnitOfElectricCurrent.AMPERE, "system", "max_discharging_current"),
-
-        # Diagnostics
-        RegisterScanSensor(hass),
-        DeviceScanSensor(hass),
-    ]
-    add_entities(entities, False)
-
-    is_updating = False
-
-    async def update_data_collector(now):
-        nonlocal is_updating
-        if is_updating:
-            if not await data_collector.is_update_stuck():
-                return
-            _LOGGER.warning("Previous update stuck, forcing new cycle")
-            is_updating = False
-
-        _LOGGER.debug("Starting data collector update")
-        is_updating = True
-        data_collector._last_update_start = datetime.now()
-
+    def native_value(self):
         try:
-            await data_collector.update_data()
-        except Exception as err:
-            _LOGGER.error(f"Error in update: {err}")
-        finally:
-            is_updating = False
-            data_collector._last_update_start = None
-            _LOGGER.debug("Data collector update finished")
+            val = self._getter(self._collector)
+            if val is None and not self._debug_once_logged:
+                src_obj = getattr(self._collector, self._getter.src_attr, None)
+                _LOGGER.debug(
+                    "Sensor '%s' has no value yet. Source=%s, tried keys=%s",
+                    self._name, _describe_obj(src_obj), list(self._getter.keys),
+                )
+                self._debug_once_logged = True
+            return val
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.debug("Sensor '%s' getter raised: %s", self._name, e)
+            return None
 
-    update_listener = async_track_time_interval(hass, update_data_collector, timedelta(seconds=scan_interval))
-    config_entry.async_on_unload(update_listener)
+    async def async_added_to_hass(self) -> None:
+        @callback
+        def _updated():
+            # helpful to see that dispatcher fired and we pushed a state
+            try:
+                val = self.native_value
+            except Exception:  # noqa: BLE001
+                val = None
+            _LOGGER.debug("Sensor write: %s = %s", self._name, val)
+            self.async_write_ha_state()
 
-    _LOGGER.debug("Easun Inverter sensors added")
+        self._unsub = async_dispatcher_connect(self.hass, SIGNAL_COLLECTOR_UPDATED, _updated)
+        _LOGGER.debug("Sensor subscribed: %s (src=%s, keys=%s)", self._name, self._getter.src_attr, list(self._getter.keys))
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub:
+            self._unsub()
+            self._unsub = None
