@@ -1,267 +1,210 @@
-# easunpy/async_modbusclient.py
-
-"""
-easunpy.async_modbusclient
---------------------------
-TCP "cloud-server" shim for Voltronic/PI18 ASCII via the FF 04 wrapper.
-"""
-
-from __future__ import annotations
-
-import asyncio
-import logging
+# modbusclient.py full code
 import socket
 import struct
 import time
-from typing import List, Optional, Tuple, Union
+import logging  # Import logging
 
-_LOGGER = logging.getLogger("easunpy.async_modbusclient")
+from easunpy.crc import crc16_modbus, crc16_xmodem, adjust_crc_byte
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def _to_bytes(req: Union[bytes, bytearray, memoryview, str, List[int], Tuple[int, ...]]) -> bytes:
-    """Coerce various request types into raw bytes."""
-    if isinstance(req, (bytes, bytearray, memoryview)):
-        return bytes(req)
-    if isinstance(req, str):
-        s = req.strip()
-        # Heuristic: hex string (even length, hex chars only)
-        if len(s) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in s):
+class ModbusClient:
+    def __init__(self, inverter_ip: str, local_ip: str, port: int = 8899):
+        self.inverter_ip = inverter_ip
+        self.local_ip = local_ip
+        self.port = port
+        self.request_id = 0  # Add request ID counter
+
+    def send_udp_discovery(self) -> bool:
+        """Perform UDP discovery to initialize the inverter communication."""
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_sock:
+            udp_message = f"set>server={self.local_ip}:{self.port};"
             try:
-                return bytes.fromhex(s)
-            except ValueError:
-                # Fall back to raw encoding
-                pass
-        try:
-            return s.encode("ascii")
-        except Exception:
-            return s.encode("latin-1", "ignore")
-    # Maybe an iterable of ints (0..255)
-    try:
-        return bytes(req)  # type: ignore[arg-type]
-    except Exception as exc:
-        raise TypeError(f"Unsupported request type for transport: {type(req)!r}") from exc
+                logger.debug(f"Sending UDP discovery message to {self.inverter_ip}:58899")
+                udp_sock.sendto(udp_message.encode(), (self.inverter_ip, 58899))
+                response, _ = udp_sock.recvfrom(1024)
+                return True
+            except socket.timeout:
+                logger.error("UDP discovery timed out")
+                return False
+            except Exception as e:
+                logger.error(f"Error sending UDP discovery message: {e}")
+                return False
 
+    def send(self, hex_command: str, retry_count: int = 2) -> str:
+        """Send a Modbus TCP command."""
+        command_bytes = bytes.fromhex(hex_command)
+        logger.info(f"Sending command: {hex_command}")
 
-class AsyncModbusClient:
-    """Listens on TCP and speaks the FF 04 tunnel with the inverter (server mode)."""
+        for attempt in range(retry_count):
+            logger.debug(f"Attempt {attempt + 1} of {retry_count}")
+            
+            if not self.send_udp_discovery():
+                logger.info("UDP discovery failed")
+                time.sleep(1)
+                continue
 
-    def __init__(
-        self,
-        inverter_ip: str,
-        local_ip: str,
-        port: int = 502,
-        connect_timeout: float = 60.0,
-    ):
-        self._inverter_ip = inverter_ip
-        self._local_ip = local_ip
-        self._port = port
-        self._connect_timeout = connect_timeout
-
-        self._server: Optional[asyncio.AbstractServer] = None
-        self._reader: Optional[asyncio.StreamReader] = None
-        self._writer: Optional[asyncio.StreamWriter] = None
-
-        self._client_ready = asyncio.Event()
-        self._lock = asyncio.Lock()
-        self._trans_id = int(time.time()) & 0xFFFF
-
-        self._udp_task: Optional[asyncio.Task] = None
-        self._udp_interval = 5.0
-
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self.start())
-        except RuntimeError:
-            pass
-
-    async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        if self._writer and not self._writer.is_closing():
-            try:
-                self._writer.close()
-                await self._writer.wait_closed()
-            except Exception:
-                pass
-        self._reader = reader
-        self._writer = writer
-        peer = writer.get_extra_info("peername")
-        if peer:
-            _LOGGER.info("Inverter connected from %s:%s", peer[0], peer[1])
-        else:
-            _LOGGER.info("Inverter connected")
-        self._client_ready.set()
-
-    async def _try_start_at(self, host: Optional[str]) -> Optional[asyncio.AbstractServer]:
-        try:
-            server = await asyncio.start_server(self._on_client, host=host, port=self._port)
-            bound = None
-            if server.sockets:
-                sock = server.sockets[0].getsockname()
-                bound = f"{sock[0]}:{sock[1]}"
-            _LOGGER.debug("TCP server listening on %s", bound or f"{host}:{self._port}")
-            return server
-        except OSError as exc:
-            _LOGGER.warning("Failed binding listener on %s:%s -> %s", host, self._port, exc, exc_info=False)
-            return None
-
-    async def start(self) -> None:
-        if self._server is not None:
-            return
-
-        server = None
-        if self._local_ip and self._local_ip != "0.0.0.0":
-            server = await self._try_start_at(self._local_ip)
-
-        if server is None:
-            server = await self._try_start_at("0.0.0.0")
-
-        if server is None:
-            server = await self._try_start_at(None)
-
-        if server is None:
-            raise OSError(f"Could not start TCP listener on {self._local_ip}:{self._port} (and fallbacks)")
-
-        self._server = server
-        self._ensure_udp_task()
-
-    def _ensure_udp_task(self) -> None:
-        if not self._inverter_ip:
-            _LOGGER.debug("UDP discovery disabled (no inverter_ip configured)")
-            return
-        if self._udp_task is None or self._udp_task.done():
-            loop = asyncio.get_running_loop()
-            self._udp_task = loop.create_task(self._udp_discovery_loop())
-
-    async def ensure_listening(self) -> None:
-        if self._server is None:
-            await self.start()
-        self._ensure_udp_task()
-
-    def is_connected(self) -> bool:
-        return bool(self._reader and self._writer and not self._writer.is_closing())
-
-    async def stop(self) -> None:
-        if self._udp_task is not None:
-            self._udp_task.cancel()
-            try:
-                await self._udp_task
-            except Exception:
-                pass
-            self._udp_task = None
-
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
-        if self._writer is not None:
-            try:
-                self._writer.close()
-                await self._writer.wait_closed()
-            except Exception:
-                pass
-        self._reader = None
-        self._writer = None
-        self._client_ready.clear()
-        _LOGGER.debug("Server cleaned up successfully")
-
-    def _discovery_payload(self) -> bytes:
-        return f"set>server={self._local_ip}:{self._port};".encode("ascii")
-
-    async def _udp_discovery_loop(self) -> None:
-        payload = self._discovery_payload()
-        target = (self._inverter_ip, 58899)
-
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-            try:
-                if self._local_ip and self._local_ip != "0.0.0.0":
-                    sock.bind((self._local_ip, 0))
-            except OSError:
-                pass
-            sock.settimeout(0.2)
-        except Exception as exc:
-            _LOGGER.warning("UDP discovery disabled (socket error): %s", exc, exc_info=False)
-            return
-
-        _LOGGER.debug("UDP discovery loop started (interval=%ss, target=%s:%s)", self._udp_interval, target[0], target[1])
-
-        try:
-            while True:
-                if not self.is_connected():
-                    try:
-                        sock.sendto(payload, target)
-                        _LOGGER.debug("UDP discovery sent (inverter not connected) to %s:%s payload=%r", target[0], target[1], payload)
-                    except Exception as exc:
-                        _LOGGER.debug("UDP send error to %s:%s -> %s", target[0], target[1], exc, exc_info=False)
-                else:
-                    _LOGGER.debug("Skipping UDP discovery (inverter is connected)")
-
-                await asyncio.sleep(self._udp_interval)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            try:
-                sock.close()
-            except Exception:
-                pass
-            _LOGGER.debug("UDP discovery loop stopped")
-
-    async def send_bulk(self, requests: List[Union[bytes, str]], timeout: float = 5.0) -> List[Optional[bytes]]:
-        if not requests:
-            return []
-        async with self._lock:
-            await self.ensure_listening()
-            if not self.is_connected():
-                _LOGGER.debug("No inverter connection yet; skipping this cycle")
-                return [None for _ in requests]
-
-            results: List[Optional[bytes]] = []
-            assert self._reader and self._writer
-            for req in requests:
-                try:
-                    req_bytes = _to_bytes(req)
-                    _LOGGER.debug("Sending command: %s", req_bytes.hex())
-                    self._writer.write(req_bytes)
-                    await self._writer.drain()
-
-                    header = await asyncio.wait_for(self._reader.readexactly(6), timeout=timeout)
-                    length = struct.unpack(">H", header[4:6])[0]
-                    rest = await asyncio.wait_for(self._reader.readexactly(length), timeout=timeout)
-                    resp = header + rest
-                    _LOGGER.debug("Response: %s", resp.hex())
-                    results.append(resp)
-                except asyncio.TimeoutError:
-                    _LOGGER.warning("No response for a command (read timeout)")
-                    results.append(None)
-                except Exception as exc:
-                    _LOGGER.error("Transport error: %s", exc, exc_info=False)
-                    results.append(None)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_server:
+                tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
                 
-                # ** THE FIX IS HERE **
-                # Add a small delay to give the inverter time to process
-                await asyncio.sleep(0.3)
-            return results
+                try:
+                    # Attempt to bind to the local IP and port
+                    logger.debug(f"Binding to {self.local_ip}:{self.port}")
+                    tcp_server.bind((self.local_ip, self.port))
+                    tcp_server.listen(1)
 
-    async def send_ascii_command(self, ascii_command_packet: Union[bytes, str], timeout: float = 5.0) -> Optional[bytes]:
-        async with self._lock:
-            await self.ensure_listening()
-            if not self.is_connected():
-                _LOGGER.debug("No inverter connection yet; skipping settings command")
-                return None
-            try:
-                req_bytes = _to_bytes(ascii_command_packet)
-                assert self._reader and self._writer
-                _LOGGER.debug("Sending command: %s", req_bytes.hex())
-                self._writer.write(req_bytes)
-                await self._writer.drain()
-                header = await asyncio.wait_for(self._reader.readexactly(6), timeout=timeout)
-                length = struct.unpack(">H", header[4:6])[0]
-                rest = await asyncio.wait_for(self._reader.readexactly(length), timeout=timeout)
-                resp = header + rest
-                _LOGGER.debug("Response: %s", resp.hex())
-                return resp
-            except asyncio.TimeoutError:
-                _LOGGER.warning("No response for settings command (read timeout)")
-                return None
-            except Exception as exc:
-                _LOGGER.error("Transport error on settings command: %s", exc, exc_info=False)
-                return None
+                    logger.debug("Waiting for client connection...")
+                    client_sock, addr = tcp_server.accept()
+                    logger.info(f"Client connected from {addr}")
+                    
+                    with client_sock:
+                        logger.debug("Sending command bytes...")
+                        client_sock.sendall(command_bytes)
+
+                        logger.debug("Waiting for response...")
+                        response = client_sock.recv(4096)
+                        if response:
+                            logger.debug(f"Received response: {response.hex()}")
+                            return response.hex()
+                        else:
+                            logger.warning("No response received")
+                except Exception as e:
+                    logger.error(f"Error during TCP communication: {e}")
+                
+            time.sleep(1)
+        
+        return ""
+
+def create_request(transaction_id: int, protocol_id: int, unit_id: int, function_code: int, start: int, count: int) -> str:
+    """
+    Creates a Modbus TCP request in hexadecimal format.
+    :param transaction_id: Transaction ID.
+    :param protocol_id: Protocol ID.
+    :param unit_id: Unit ID.
+    :param function_code: Function code.
+    :param start: Starting register address.
+    :param count: Number of registers to read.
+    :return: Hexadecimal string of the Modbus request.
+    """
+    # Construir el paquete RTU (sin TCP header)
+    rtu_packet = bytearray([
+        unit_id, function_code,
+        (start >> 8) & 0xFF, start & 0xFF,
+        (count >> 8) & 0xFF, count & 0xFF
+    ])
+    
+    # Calcular CRC sobre el paquete RTU
+    crc = crc16_modbus(rtu_packet)
+    crc_low = crc & 0xFF
+    crc_high = (crc >> 8) & 0xFF
+    rtu_packet.extend([crc_low, crc_high])
+    
+    # Campo adicional `FF04`
+    rtu_packet = bytearray([0xFF, 0x04]) + rtu_packet
+    
+    # Calcular la longitud total (incluye solo RTU) + TCP
+    length = len(rtu_packet)
+    
+    # Construir el comando completo
+    command = bytearray([
+        (transaction_id >> 8) & 0xFF, transaction_id & 0xFF,  # Transaction ID
+        (protocol_id >> 8) & 0xFF, protocol_id & 0xFF,        # Protocol ID
+        (length >> 8) & 0xFF, length & 0xFF                  # Longitud
+    ]) + rtu_packet
+
+    return command.hex()
+
+def decode_modbus_response(response: str, register_count: int=1, data_format: str="Int"):
+    """
+    Decodes a Modbus TCP response using the provided format.
+    :param request: Hexadecimal string of the Modbus request.
+    :param response: Hexadecimal string of the Modbus response.
+    :return: Dictionary with register addresses and their values.
+    """
+    # Extract common fields from response
+    req_id = response[:8]
+    length_hex = response[8:12]
+    length = int(length_hex, 16)
+    
+    # Extract RTU payload
+    rtu_payload = response[12:12 + length * 2]
+
+    # Decode RTU Payload
+    extra_field = rtu_payload[:2]
+    device_address = rtu_payload[2:4]
+    function_code = rtu_payload[4:6]
+    num_data_bytes = int(rtu_payload[8:10], 16)
+    data_bytes = rtu_payload[10:10 + num_data_bytes * 2]
+    # Decode the register values and pair with addresses
+    values = []
+    for i, _ in enumerate(range(register_count)):
+        if data_format == "Int":
+            # Handle signed 16-bit integers
+            value = int(data_bytes[i * 4:(i + 1) * 4], 16)
+            # If the highest bit is set (value >= 32768), it's negative
+            if value >= 32768:  # 0x8000
+                value -= 65536  # 0x10000
+        elif data_format == "UnsignedInt":
+            # Handle unsigned 16-bit integers (0 to 65535)
+            value = int(data_bytes[i * 4:(i + 1) * 4], 16)
+        elif data_format == "Float":
+            value = struct.unpack('f', bytes.fromhex(data_bytes[i * 4:(i + 1) * 4]))[0]
+        else:
+            raise ValueError(f"Unsupported data format: {data_format}")
+        values.append(value)
+
+    return values
+
+def get_registers_from_request(request: str) -> list:
+    """
+    Extracts register addresses from a Modbus request
+    :param request: Hexadecimal string of the Modbus request
+    :return: List of register addresses
+    """
+    rtu_payload = request[12:]  # Skip TCP header
+    register_address = int(rtu_payload[8:12], 16)  # Get register address from RTU payload
+    register_count = int(rtu_payload[12:16], 16)  # Get number of registers
+    
+    registers = []
+    for i in range(register_count):
+        registers.append(register_address + i)
+        
+    return registers
+
+def create_ascii_request(transaction_id: int, protocol_id: int, command: str) -> str:
+    command_bytes = command.encode('ascii')
+    crc = crc16_xmodem(command_bytes)
+    crc_high = adjust_crc_byte((crc >> 8) & 0xFF)
+    crc_low = adjust_crc_byte(crc & 0xFF)
+    data = command_bytes + bytes([crc_high, crc_low, 0x0D])
+    length = len(data) + 2  # + FF 04
+    tcp_header = bytes([
+        (transaction_id >> 8) & 0xFF, transaction_id & 0xFF,
+        (protocol_id >> 8) & 0xFF, protocol_id & 0xFF,
+        (length >> 8) & 0xFF, length & 0xFF
+    ])
+    rtu_prefix = bytes([0xFF, 0x04])
+    full_command = tcp_header + rtu_prefix + data
+    return full_command.hex()
+
+def decode_ascii_response(response_hex) -> str:
+    # Accept both hex string and raw bytes
+    if not response_hex:
+        return ""
+    if isinstance(response_hex, (bytes, bytearray)):
+        response = bytes(response_hex)
+    else:
+        response = bytes.fromhex(response_hex)
+    if len(response) < 6:
+        return ""
+    length = (response[4] << 8) | response[5]
+    if len(response) < 6 + length:
+        return ""
+    payload = response[6:6+length]
+    if len(payload) < 3 or payload[0] != 0xFF or payload[1] != 0x04:
+        return ""
+    data = payload[2:-3]  # remove FF04, CRC (2), \r (1)
+    return data.decode('ascii', errors='ignore')
