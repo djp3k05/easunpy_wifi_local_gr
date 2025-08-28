@@ -4,7 +4,7 @@ import struct
 import time
 import logging  # Import logging
 
-from .crc import crc16_modbus, crc16_xmodem, adjust_crc_byte
+from easunpy.crc import crc16_modbus, crc16_xmodem, adjust_crc_byte
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -190,14 +190,10 @@ def create_ascii_request(transaction_id: int, protocol_id: int, command: str) ->
     full_command = tcp_header + rtu_prefix + data
     return full_command.hex()
 
-def decode_ascii_response(response_hex) -> str:
-    # Accept both hex string and raw bytes
+def decode_ascii_response(response_hex: str) -> str:
     if not response_hex:
         return ""
-    if isinstance(response_hex, (bytes, bytearray)):
-        response = bytes(response_hex)
-    else:
-        response = bytes.fromhex(response_hex)
+    response = bytes.fromhex(response_hex)
     if len(response) < 6:
         return ""
     length = (response[4] << 8) | response[5]

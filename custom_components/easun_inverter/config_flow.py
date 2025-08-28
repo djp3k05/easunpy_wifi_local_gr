@@ -9,9 +9,10 @@ import logging
 from datetime import timedelta
 
 from . import DOMAIN
-from .discover import discover_device
-from .utils import get_local_ip
-from .models import MODEL_CONFIGS
+from .const import DEFAULT_SCAN_INTERVAL
+from easunpy.discover import discover_device
+from easunpy.utils import get_local_ip
+from easunpy.models import MODEL_CONFIGS
 
 DEFAULT_SCAN_INTERVAL = 30  # Default to 30 seconds
 _LOGGER = logging.getLogger(__name__)
