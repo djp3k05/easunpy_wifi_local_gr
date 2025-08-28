@@ -209,16 +209,16 @@ class AsyncISolar:
         raw_qpiri = decode_ascii_response(responses[4])
 
         if not raw_qpigs or not raw_qmod:
-            raise ValueError("Invalid ASCII responses")
+            _LOGGER.debug("Invalid ASCII responses; continuing with partial data this cycle")
 
-        qpigs = raw_qpigs.lstrip("(").split()
+        qpigs = raw_qpigs.lstrip("(").split() if raw_qpigs else []
         qpigs2 = raw_qpigs2.lstrip("(").split() if raw_qpigs2 else []
         qpiws = raw_qpiws.lstrip("(").strip() if raw_qpiws else ""
         qpiri = raw_qpiri.lstrip("(").split() if raw_qpiri else []
-        qmod = raw_qmod.lstrip("(").strip()
+        qmod = raw_qmod.lstrip("(").strip() if raw_qmod else ""
 
         if len(qpigs) < 21:
-            raise ValueError("Unexpected QPIGS format")
+            _LOGGER.debug("Unexpected QPIGS format; skipping this cycle"); return (None, None, None, None, None)
 
         vals: Dict[str, Any] = {}
 
@@ -517,30 +517,3 @@ class AsyncISolar:
         except Exception as e:
             _LOGGER.warning(f"Failed to create SystemStatus: {e}")
         return None
-
-    async def set_max_utility_charging_current(self, amps: int, parallel_id: int = 0) -> bool:
-        """Set Max Utility (AC) Charging Current using MUCHGC{PP}{AA} format.
-
-        Examples known to ACK on your unit:
-            - MUCHGC0020 (20 A)
-            - MUCHGC0002 (2 A)
-        """
-        a = int(amps)
-        # Accept 2 and the tens up to 120 as per device
-        allowed = {2} | set(range(10, 121, 10))
-        if a not in allowed:
-            raise ValueError("Utility max charging current must be one of: 2,10,20,...,120 A")
-
-        m = int(parallel_id)
-        if not (0 <= m <= 9):
-            raise ValueError("Parallel id must be 0..9")
-
-        cmd = f"MUCHGC{m:02d}{a:02d}"
-        req = create_ascii_request(self._get_next_transaction_id(), 0x0001, cmd)
-        responses = await self.client.send_bulk([req])
-        if not responses:
-            return False
-        raw = decode_ascii_response(responses[0])
-        _LOGGER.debug("apply_setting(%s) -> %s", cmd, raw)
-        return raw.startswith("(ACK")
-
