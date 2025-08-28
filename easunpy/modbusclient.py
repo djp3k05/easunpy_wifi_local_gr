@@ -190,10 +190,15 @@ def create_ascii_request(transaction_id: int, protocol_id: int, command: str) ->
     full_command = tcp_header + rtu_prefix + data
     return full_command.hex()
 
-def decode_ascii_response(response_hex: str) -> str:
+def decode_ascii_response(response_hex) -> str:
+    # Accept both hex string and raw bytes to avoid 'fromhex() argument must be str' crashes
     if not response_hex:
         return ""
-    response = bytes.fromhex(response_hex)
+    if isinstance(response_hex, (bytes, bytearray)):
+        response = bytes(response_hex)
+    else:
+        response = bytes.fromhex(response_hex)
+
     if len(response) < 6:
         return ""
     length = (response[4] << 8) | response[5]
