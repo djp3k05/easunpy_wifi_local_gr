@@ -1,5 +1,3 @@
-# easun_inverter/sensor.py
-
 """Support for Easun Inverter sensors."""
 from __future__ import annotations
 
@@ -21,17 +19,17 @@ from homeassistant.const import (
     PERCENTAGE,
 )
 from homeassistant.core import HomeAssistant
+    # device classes intentionally not used to keep output simple
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
 
 from . import DOMAIN
-from .const import DEFAULT_SCAN_INTERVAL
-from easunpy.async_isolar import AsyncISolar
+from .async_isolar import AsyncISolar
 
 _LOGGER = logging.getLogger(__name__)
 
+DEFAULT_SCAN_INTERVAL = 30  # seconds
 
 
 class DataCollector:
@@ -46,40 +44,18 @@ class DataCollector:
         self._last_update_start: datetime | None = None
         self._last_successful_update: datetime | None = None
         self._update_timeout = 30
-        self._entities: list[Entity] = []
+        self._sensors: list[SensorEntity] = []
         _LOGGER.info(f"DataCollector initialized with model: {self._isolar.model}")
 
-    def register_entity(self, entity: Entity) -> None:
-        self._entities.append(entity)
-        _LOGGER.debug(f"Registered entity: {entity.name}")
+    def register_sensor(self, sensor: SensorEntity) -> None:
+        self._sensors.append(sensor)
+        _LOGGER.debug(f"Registered sensor: {sensor.name}")
 
     async def is_update_stuck(self) -> bool:
         if self._last_update_start is None:
             return False
         elapsed = (datetime.now() - self._last_update_start).total_seconds()
         return elapsed > self._update_timeout
-
-    def update_last_command_status(self, success: bool):
-        """Update the status of the last sent command."""
-        status = "Success" if success else "Fail"
-        timestamp = datetime.now().strftime('%H:%M:%S')
-        
-        # Ensure the system dictionary exists
-        if "system" not in self._data:
-            self._data["system"] = {}
-            
-        self._data["system"]["last_command_response"] = f"{status} @ {timestamp}"
-        
-        # Manually trigger an update for the response sensor
-        for entity in self._entities:
-            # The key is a custom attribute we add to the sensor to identify it
-            if hasattr(entity, '_key') and entity._key == 'last_command_response':
-                if hasattr(entity, 'update_from_collector'):
-                    entity.update_from_collector()
-                # Schedule the state update in the event loop
-                if entity.hass:
-                    entity.async_schedule_update_ha_state(True)
-                break
 
     async def update_data(self) -> None:
         if self._lock.locked():
@@ -91,12 +67,9 @@ class DataCollector:
             update_task = asyncio.create_task(self._do_update())
             try:
                 await asyncio.wait_for(update_task, timeout=self._update_timeout)
-                for entity in self._entities:
-                    if hasattr(entity, 'update_from_collector'):
-                        # Don't update the response sensor during normal polling
-                        if not (hasattr(entity, '_key') and entity._key == 'last_command_response'):
-                             entity.update_from_collector()
-                _LOGGER.debug("Updated all registered entities")
+                for sensor in self._sensors:
+                    sensor.update_from_collector()
+                _LOGGER.debug("Updated all registered sensors")
                 self._last_successful_update = datetime.now()
                 self._consecutive_failures = 0
             except asyncio.TimeoutError:
@@ -121,12 +94,6 @@ class DataCollector:
         self._data["grid"] = grid.__dict__ if grid else {}
         self._data["output"] = output.__dict__ if output else {}
         self._data["system"] = status.__dict__ if status else {}
-        # Preserve last command response across updates if it exists
-        last_response = self._data.get("system", {}).get("last_command_response")
-        if last_response:
-            if "system" not in self._data: self._data["system"] = {}
-            self._data["system"]["last_command_response"] = last_response
-
 
     def get_data(self, section: str, key: str):
         return self._data.get(section, {}).get(key)
@@ -134,8 +101,6 @@ class DataCollector:
 
 class EasunSensor(SensorEntity):
     """Representation of an Easun Inverter sensor."""
-
-    _attr_should_poll = False
 
     def __init__(
         self,
@@ -155,7 +120,7 @@ class EasunSensor(SensorEntity):
         self._key = key
         self._converter = converter
         self._state = None
-        self._collector.register_entity(self)
+        self._collector.register_sensor(self)
 
     @property
     def unique_id(self) -> str:
@@ -184,10 +149,8 @@ class EasunSensor(SensorEntity):
         if self._converter and value is not None:
             value = self._converter(value)
         self._state = value
-        try:
-            self.async_write_ha_state()
-        except Exception:
-            pass
+
+
 class RegisterScanSensor(SensorEntity):
     def __init__(self, hass: HomeAssistant):
         self._attr_name = "Easun Register Scan"
@@ -251,20 +214,24 @@ async def async_setup_entry(
     local_ip = config_entry.data["local_ip"]
     model = config_entry.data["model"]
 
+    # Read scan_interval from options, fallback to DEFAULT_SCAN_INTERVAL
     scan_interval = config_entry.options.get("scan_interval", DEFAULT_SCAN_INTERVAL)
     _LOGGER.debug(f"Setting up entry with scan_interval: {scan_interval}")
 
+    # Initialize inverter client and data collector
     isolar = AsyncISolar(inverter_ip, local_ip, model)
     data_collector = DataCollector(isolar)
 
+    # Ensure domain data structure exists
     hass.data.setdefault(DOMAIN, {})[entry_id] = {"coordinator": data_collector}
 
+    # Helper: Hz fields are reported as int(Hz*100)
     frequency_converter = lambda v: (v / 100) if v is not None else None
 
+    # -----------------------------
+    # Build sensor entities
+    # -----------------------------
     entities: list[SensorEntity] = [
-        # NEW SENSOR
-        EasunSensor(data_collector, "last_command_response", "Last Command Response", None, "system", "last_command_response"),
-
         # Battery runtime
         EasunSensor(data_collector, "battery_voltage", "Battery Voltage", UnitOfElectricPotential.VOLT, "battery", "voltage"),
         EasunSensor(data_collector, "battery_current", "Battery Current", UnitOfElectricCurrent.AMPERE, "battery", "current"),
@@ -277,7 +244,7 @@ async def async_setup_entry(
         EasunSensor(data_collector, "battery_voltage_offset_fans", "Battery Voltage Offset for Fans", UnitOfElectricPotential.VOLT, "battery", "voltage_offset_for_fans"),
         EasunSensor(data_collector, "battery_eeprom_version", "EEPROM Version", None, "battery", "eeprom_version"),
 
-        # PV runtime
+        # PV runtime (note: PV Temperature removed)
         EasunSensor(data_collector, "pv_total_power", "PV Total Power", UnitOfPower.WATT, "pv", "total_power"),
         EasunSensor(data_collector, "pv_charging_power", "PV Charging Power", UnitOfPower.WATT, "pv", "charging_power"),
         EasunSensor(data_collector, "pv_charging_current", "PV Charging Current", UnitOfElectricCurrent.AMPERE, "pv", "charging_current"),
@@ -344,6 +311,7 @@ async def async_setup_entry(
     ]
     add_entities(entities, False)
 
+    # Periodic updates and HA state write
     is_updating = False
 
     async def update_data_collector(now):
@@ -360,6 +328,8 @@ async def async_setup_entry(
 
         try:
             await data_collector.update_data()
+            for sensor in entities:
+                sensor.async_write_ha_state()
         except Exception as err:
             _LOGGER.error(f"Error in update: {err}")
         finally:

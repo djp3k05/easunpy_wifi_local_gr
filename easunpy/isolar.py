@@ -1,7 +1,7 @@
 import logging
 from typing import List, Optional
 from .modbusclient import ModbusClient, create_request, decode_modbus_response
-from easunpy.models import BatteryData, PVData, GridData, OutputData, OperatingMode, SystemStatus
+from .models import BatteryData, PVData, GridData, OutputData, OperatingMode, SystemStatus
 
 # Set up logging
 logger = logging.getLogger(__name__)
