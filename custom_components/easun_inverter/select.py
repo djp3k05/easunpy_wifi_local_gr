@@ -174,4 +174,4 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, add_entitie
         MaxUtilityChargingCurrentSelect(coordinator),
     ]
     add_entities(entities)
-    _LOGGER.debug("Select entities added")
+    _LOGGER.debug("Select entities added") 
