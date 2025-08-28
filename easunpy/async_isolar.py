@@ -1,43 +1,16 @@
-"""
-easunpy.async_isolar
---------------------
-Async high-level API for Easun/Voltronic inverters.
-
-- Constructor stays compatible with sensor.py:
-    AsyncISolar(inverter_ip, local_ip, model="ISOLAR_SMG_II_11K")
-- ASCII read path (QPIGS/QPIGS2/QMOD/QPIWS/QPIRI).
-- Settings helpers (apply_setting + typed wrappers).
-- IMPORTANT: Decoding is now robust to both bytes and hex-string inputs.
-  If the underlying decode expects a hex str, we pass resp.hex() automatically.
-
-Depends on:
-- easunpy.async_modbusclient.AsyncModbusClient
-- easunpy.modbusclient.create_ascii_request / decode_ascii_response
-- easunpy.models dataclasses
-"""
-
-from __future__ import annotations
-
 import logging
 from typing import Optional, Dict, Tuple, Any, List
-
 from .async_modbusclient import AsyncModbusClient
 from .modbusclient import (
+    create_request,
+    decode_modbus_response,
     create_ascii_request,
     decode_ascii_response,
 )
-from .models import (
-    MODEL_CONFIGS,
-    ModelConfig,
-    BatteryData,
-    PVData,
-    GridData,
-    OutputData,
-    SystemStatus,
-    OperatingMode,
-)
+from .isolar import BatteryData, PVData, GridData, OutputData, SystemStatus, OperatingMode
+from .models import MODEL_CONFIGS, ModelConfig
 
-_LOGGER = logging.getLogger("easunpy.async_isolar")
+_LOGGER = logging.getLogger(__name__)
 
 
 class AsyncISolar:
@@ -60,257 +33,39 @@ class AsyncISolar:
         self._transaction_id = (tid + 1) & 0xFFFF
         return tid
 
-    # ---------------- Internal decode helper (bytes OR hex string) ----------------
+    # ------------- Modbus helpers -------------
 
-    @staticmethod
-    def _safe_decode(resp: Optional[bytes | str]) -> Optional[str]:
-        """Decode a full Modbus-FF04 ASCII response from either bytes or hex-string."""
-        if resp is None:
-            return None
+    async def _read_registers_bulk(
+        self,
+        register_groups: List[Tuple[int, int]],
+        data_format: str = "Int",
+    ) -> List[Optional[List[int]]]:
+        """Read multiple groups of registers in a single connection."""
         try:
-            return decode_ascii_response(resp)
-        except TypeError as e:
-            # Handle "fromhex() argument must be str, not bytes" (underlying expects hex string)
-            if "fromhex" in str(e):
-                if isinstance(resp, (bytes, bytearray, memoryview)):
-                    return decode_ascii_response(bytes(resp).hex())
-            raise
+            requests = [
+                create_request(self._get_next_transaction_id(), 0x0001, 0x00, 0x03, start, count)
+                for start, count in register_groups
+            ]
+            _LOGGER.debug(f"Sending bulk request for register groups: {register_groups}")
+            responses = await self.client.send_bulk(requests)
 
-    # ---------------------------------------------------------------------
-    # READ PATH (QPIGS/QPIGS2/QMOD/QPIWS/QPIRI) with graceful no-connection
-    # ---------------------------------------------------------------------
+            decoded_groups: List[Optional[List[int]]] = [None] * len(register_groups)
+            for i, (response, (_, count)) in enumerate(zip(responses, register_groups)):
+                try:
+                    if response:
+                        out = decode_modbus_response(response, count, data_format)
+                        _LOGGER.debug(f"Decoded values for group {i}: {out}")
+                        decoded_groups[i] = out
+                    else:
+                        _LOGGER.warning(f"No response for register group {register_groups[i]}")
+                except Exception as e:
+                    _LOGGER.warning(f"Failed to decode group {register_groups[i]}: {e}")
+            return decoded_groups
+        except Exception as e:
+            _LOGGER.error(f"Error reading registers bulk: {e}")
+            return [None] * len(register_groups)
 
-    async def _get_all_data_ascii(
-        self,
-    ) -> Tuple[
-        Optional[BatteryData],
-        Optional[PVData],
-        Optional[GridData],
-        Optional[OutputData],
-        Optional[SystemStatus],
-    ]:
-        """Fetch and parse QPIGS/QPIGS2/QMOD/QPIWS/QPIRI ASCII data."""
-        commands = ["QPIGS", "QPIGS2", "QMOD", "QPIWS", "QPIRI"]
-        requests = [create_ascii_request(self._get_next_transaction_id(), 0x0001, cmd) for cmd in commands]
-
-        responses = await self.client.send_bulk(requests)
-        # If listener is up but inverter not connected yet, send_bulk returns [None, ...].
-        if not responses or all(r is None for r in responses):
-            _LOGGER.debug("No ASCII responses (likely not connected); skipping parse")
-            return None, None, None, None, None
-
-        # Decode (each decode returns a raw "(...)" string or None)
-        raw_qpigs = self._safe_decode(responses[0])
-        raw_qpigs2 = self._safe_decode(responses[1])
-        raw_qmod = self._safe_decode(responses[2])
-        raw_qpiws = self._safe_decode(responses[3])
-        raw_qpiri = self._safe_decode(responses[4])
-
-        # If the inverter sent nothing useful yet, skip gracefully.
-        if not raw_qpigs or not raw_qmod:
-            _LOGGER.debug("ASCII responses incomplete (no QPIGS/QMOD); skipping parse")
-            return None, None, None, None, None
-
-        qpigs = raw_qpigs.lstrip("(").split()
-        qpigs2 = raw_qpigs2.lstrip("(").split() if raw_qpigs2 else []
-        qpiws = raw_qpiws.lstrip("(").strip() if raw_qpiws else ""
-        qpiri = raw_qpiri.lstrip("(").split() if raw_qpiri else []
-        qmod = raw_qmod.lstrip("(").strip()
-
-        if len(qpigs) < 21:
-            _LOGGER.debug("Unexpected QPIGS format; skipping parse")
-            return None, None, None, None, None
-
-        vals: Dict[str, Any] = {}
-
-        # -------- QPIGS (runtime) --------
-        # Indices per your PS parser (21 fields):
-        # 0 GV, 1 GF, 2 OV, 3 OF, 4 OVA, 5 OW, 6 OLOAD%, 7 BUSV,
-        # 8 BV, 9 BchgA, 10 BCap%, 11 HeatSinkC,
-        # 12 PV1A, 13 PV1V, 14 BattV_SCC, 15 BdisA,
-        # 16 DevStatus, 17 FanOffset x10mV, 18 EEPROM, 19 PV1W, 20 DevStatus2
-        vals["grid_voltage"] = float(qpigs[0])
-        vals["grid_frequency"] = float(qpigs[1])
-        vals["output_voltage"] = float(qpigs[2])
-        vals["output_frequency"] = float(qpigs[3])
-        vals["output_apparent_power"] = int(float(qpigs[4]))
-        vals["output_power"] = int(float(qpigs[5]))
-        vals["output_load_percentage"] = int(float(qpigs[6]))
-        vals["bus_voltage"] = float(qpigs[7])
-
-        vals["battery_voltage"] = float(qpigs[8])
-        battery_chg = float(qpigs[9])                # A
-        vals["battery_charge_current"] = battery_chg
-        vals["battery_soc"] = int(float(qpigs[10]))  # %
-        vals["battery_temperature"] = int(float(qpigs[11]))  # inverter heat-sink temp (°C)
-
-        pv1_curr = float(qpigs[12])
-        pv1_volt = float(qpigs[13])
-        vals["battery_voltage_scc"] = float(qpigs[14])
-        battery_dis = float(qpigs[15])
-        vals["battery_discharge_current"] = battery_dis
-        vals["device_status_flags"] = qpigs[16]
-        vals["battery_voltage_offset_for_fans"] = float(qpigs[17])
-        vals["eeprom_version"] = qpigs[18]
-
-        raw_pv1_power = qpigs[19]
-        pv1_power = int(float(raw_pv1_power))
-        vals["device_status_flags2"] = qpigs[20]
-
-        vals["battery_current"] = battery_chg - battery_dis
-        vals["battery_power"] = int(vals["battery_voltage"] * vals["battery_current"])
-
-        vals["pv1_current"] = pv1_curr
-        vals["pv1_voltage"] = pv1_volt
-        vals["pv1_power"] = pv1_power
-        vals["pv_total_power"] = pv1_power
-        vals["pv_charging_power"] = pv1_power
-        vals["pv_charging_current"] = pv1_curr
-
-        # -------- QPIGS2 (PV2 if present) --------
-        if len(qpigs2) >= 3:
-            pv2_curr = float(qpigs2[0])
-            pv2_volt = float(qpigs2[1])
-            raw_pv2_power = qpigs2[2]
-            pv2_power = int(float(raw_pv2_power))
-            vals["pv2_current"] = pv2_curr
-            vals["pv2_voltage"] = pv2_volt
-            vals["pv2_power"] = pv2_power
-            vals["pv_total_power"] += pv2_power
-            vals["pv_charging_power"] += pv2_power
-            vals["pv_charging_current"] += pv2_curr
-        else:
-            vals["pv2_current"] = 0.0
-            vals["pv2_voltage"] = 0.0
-            vals["pv2_power"] = 0
-
-        # Grid power estimate: output + battery - pv
-        net = vals["output_power"] + vals["battery_power"] - vals["pv_charging_power"]
-        vals["grid_power"] = max(0, int(net))
-
-        # Output current (A) ≈ S / V
-        vals["output_current"] = round(
-            (vals["output_apparent_power"] / vals["output_voltage"]) if vals["output_voltage"] > 0 else 0.0, 1
-        )
-
-        # -------- QPIWS (warnings) --------
-        if qpiws:
-            vals["warnings"] = self._decode_qpiws(qpiws)
-
-        # -------- QMOD (operating mode) --------
-        if qmod in ["L", "C"]:
-            vals["operation_mode"] = OperatingMode.SUB.value
-            vals["mode_name"] = "Line Mode" if qmod == "L" else "Charging Mode"
-        elif qmod == "B":
-            vals["operation_mode"] = OperatingMode.SBU.value
-            vals["mode_name"] = "Battery Mode"
-        elif qmod == "S":
-            vals["operation_mode"] = OperatingMode.IDLE.value
-            vals["mode_name"] = "Standby Mode"
-        elif qmod == "F":
-            vals["operation_mode"] = OperatingMode.FAULT.value
-            vals["mode_name"] = "Fault Mode"
-        else:
-            vals["operation_mode"] = OperatingMode.FAULT.value
-            vals["mode_name"] = f"UNKNOWN ({qmod})"
-
-        # -------- QPIRI (ratings/settings) --------
-        if qpiri:
-            vals.update(self._map_qpiri(qpiri))
-
-        # -------- Build dataclasses --------
-        battery = BatteryData(
-            voltage=vals.get("battery_voltage"),
-            current=vals.get("battery_current"),
-            power=vals.get("battery_power"),
-            soc=vals.get("battery_soc"),
-            temperature=vals.get("battery_temperature"),
-            charge_current=vals.get("battery_charge_current"),
-            discharge_current=vals.get("battery_discharge_current"),
-            voltage_scc=vals.get("battery_voltage_scc"),
-            voltage_offset_for_fans=vals.get("battery_voltage_offset_for_fans"),
-            eeprom_version=vals.get("eeprom_version"),
-        )
-        pv = PVData(
-            total_power=vals.get("pv_total_power"),
-            charging_power=vals.get("pv_charging_power"),
-            charging_current=vals.get("pv_charging_current"),
-            temperature=None,  # PV temp duplicates inverter temp on this model
-            pv1_voltage=vals.get("pv1_voltage"),
-            pv1_current=vals.get("pv1_current"),
-            pv1_power=vals.get("pv1_power"),
-            pv2_voltage=vals.get("pv2_voltage"),
-            pv2_current=vals.get("pv2_current"),
-            pv2_power=vals.get("pv2_power"),
-            pv_generated_today=None,
-            pv_generated_total=None,
-        )
-        grid = GridData(
-            voltage=vals.get("grid_voltage"),
-            power=vals.get("grid_power"),
-            frequency=vals.get("grid_frequency"),
-        )
-        output = OutputData(
-            voltage=vals.get("output_voltage"),
-            current=vals.get("output_current"),
-            power=vals.get("output_power"),
-            apparent_power=vals.get("output_apparent_power"),
-            load_percentage=vals.get("output_load_percentage"),
-            frequency=vals.get("output_frequency"),
-        )
-        system = SystemStatus(
-            operating_mode=OperatingMode(vals.get("operation_mode", OperatingMode.FAULT.value)),
-            mode_name=vals.get("mode_name"),
-            inverter_time=None,
-            warnings=vals.get("warnings"),
-            device_status_flags=vals.get("device_status_flags"),
-            device_status_flags2=vals.get("device_status_flags2"),
-            bus_voltage=vals.get("bus_voltage"),
-            grid_rating_voltage=vals.get("grid_rating_voltage"),
-            grid_rating_current=vals.get("grid_rating_current"),
-            ac_output_rating_voltage=vals.get("ac_output_rating_voltage"),
-            ac_output_rating_frequency=vals.get("ac_output_rating_frequency"),
-            ac_output_rating_current=vals.get("ac_output_rating_current"),
-            ac_output_rating_apparent_power=vals.get("ac_output_rating_apparent_power"),
-            ac_output_rating_active_power=vals.get("ac_output_rating_active_power"),
-            battery_rating_voltage=vals.get("battery_rating_voltage"),
-            battery_recharge_voltage=vals.get("battery_recharge_voltage"),
-            battery_undervoltage=vals.get("battery_undervoltage"),
-            battery_bulk_voltage=vals.get("battery_bulk_voltage"),
-            battery_float_voltage=vals.get("battery_float_voltage"),
-            battery_type=vals.get("battery_type"),
-            max_ac_charging_current=vals.get("max_ac_charging_current"),
-            max_charging_current=vals.get("max_charging_current"),
-            input_voltage_range=vals.get("input_voltage_range"),
-            output_source_priority=vals.get("output_source_priority"),
-            charger_source_priority=vals.get("charger_source_priority"),
-            parallel_max_num=vals.get("parallel_max_num"),
-            machine_type=vals.get("machine_type"),
-            topology=vals.get("topology"),
-            output_mode_qpiri=vals.get("output_mode_qpiri"),
-            battery_redischarge_voltage=vals.get("battery_redischarge_voltage"),
-            pv_ok_condition=vals.get("pv_ok_condition"),
-            pv_power_balance=vals.get("pv_power_balance"),
-            max_charging_time_cv=vals.get("max_charging_time_cv"),
-            max_discharging_current=vals.get("max_discharging_current"),
-        )
-
-        return battery, pv, grid, output, system
-
-    async def get_all_data(
-        self,
-    ) -> Tuple[
-        Optional[BatteryData],
-        Optional[PVData],
-        Optional[GridData],
-        Optional[OutputData],
-        Optional[SystemStatus],
-    ]:
-        """Fetch all data for current model."""
-        # For VOLTRONIC_ASCII we only use ASCII branch.
-        return await self._get_all_data_ascii()
-
-    # ------------------ Helpers for parsing ------------------
+    # ------------- ASCII branch -------------
 
     @staticmethod
     def _decode_qpiws(bits: str) -> str:
@@ -354,17 +109,21 @@ class AsyncISolar:
         return "No warnings" if not warnings else ", ".join(warnings)
 
     @staticmethod
-    def _map_qpiri(fields: List[str]) -> Dict[str, Any]:
+    def _map_qpiri(fields: list[str]) -> Dict[str, Any]:
         """Map QPIRI numeric fields to typed values + labels."""
-        def m_output_source(code: str) -> str:
+        def map_output_source_priority(code: str) -> str:
             return {"0": "UtilitySolarBat", "1": "SolarUtilityBat", "2": "SolarBatUtility"}.get(code, code)
-        def m_batt_type(code: str) -> str:
+
+        def map_battery_type(code: str) -> str:
             return {"0": "AGM", "1": "Flooded", "2": "User", "3": "PYL"}.get(code, code)
-        def m_machine_type(code: str) -> str:
+
+        def map_machine_type(code: str) -> str:
             return {"00": "Grid tie", "01": "Off Grid", "10": "Hybrid"}.get(code, code)
-        def m_charger_priority(code: str) -> str:
+
+        def map_charger_priority(code: str) -> str:
             return {"1": "Solar first", "2": "Solar + Utility", "3": "Only solar charging permitted"}.get(code, code)
-        def m_output_mode(code: str) -> str:
+
+        def map_output_mode(code: str) -> str:
             return {
                 "00": "Single machine output",
                 "01": "Parallel output",
@@ -375,21 +134,26 @@ class AsyncISolar:
                 "06": "Phase 2 of 2 Phase output (120°)",
                 "07": "Phase 2 of 2 Phase output (180°)",
             }.get(code, code)
-        def m_topology(code: str) -> str:
+
+        def map_topology(code: str) -> str:
             return {"0": "transformerless", "1": "transformer"}.get(code, code)
-        def m_input_range(code: str) -> str:
+
+        def map_input_voltage_range(code: str) -> str:
             return {"0": "Appliance", "1": "UPS"}.get(code, code)
-        def m_pv_ok(code: str) -> str:
+
+        def map_pv_ok(code: str) -> str:
             return {"0": "As long as one", "1": "All"}.get(code, code)
-        def m_pv_balance(code: str) -> str:
+
+        def map_pv_balance(code: str) -> str:
             return {
                 "0": "Max charging = PV input max",
                 "1": "Max power = charging + utility",
             }.get(code, code)
 
-        v: Dict[str, Any] = {}
+        # Defensive: some firmwares append items; we only read the standard 27.
+        vals: Dict[str, Any] = {}
         if len(fields) >= 27:
-            v.update(
+            vals.update(
                 {
                     "grid_rating_voltage": float(fields[0]),
                     "grid_rating_current": float(fields[1]),
@@ -403,228 +167,353 @@ class AsyncISolar:
                     "battery_undervoltage": float(fields[9]),
                     "battery_bulk_voltage": float(fields[10]),
                     "battery_float_voltage": float(fields[11]),
-                    "battery_type": m_batt_type(fields[12]),
+                    "battery_type": map_battery_type(fields[12]),
                     "max_ac_charging_current": float(fields[13]),
                     "max_charging_current": float(fields[14]),
-                    "input_voltage_range": m_input_range(fields[15]),
-                    "output_source_priority": m_output_source(fields[16]),
-                    "charger_source_priority": m_charger_priority(fields[17]),
+                    "input_voltage_range": map_input_voltage_range(fields[15]),
+                    "output_source_priority": map_output_source_priority(fields[16]),
+                    "charger_source_priority": map_charger_priority(fields[17]),
                     "parallel_max_num": int(float(fields[18])),
-                    "machine_type": m_machine_type(fields[19]),
-                    "topology": m_topology(fields[20]),
-                    "output_mode_qpiri": m_output_mode(fields[21]),
+                    "machine_type": map_machine_type(fields[19]),
+                    "topology": map_topology(fields[20]),
+                    "output_mode_qpiri": map_output_mode(fields[21]),
                     "battery_redischarge_voltage": float(fields[22]),
-                    "pv_ok_condition": m_pv_ok(fields[23]),
-                    "pv_power_balance": m_pv_balance(fields[24]),
+                    "pv_ok_condition": map_pv_ok(fields[23]),
+                    "pv_power_balance": map_pv_balance(fields[24]),
                     "max_charging_time_cv": int(float(fields[25])),
                     "max_discharging_current": float(fields[26]),
                 }
             )
-        return v
+        return vals
 
-    # ---------------------------------------------------------------------
-    # WRITE PATH (settings) — one-off ASCII commands with ACK/NAK check
-    # ---------------------------------------------------------------------
+    async def _get_all_data_ascii(
+        self,
+    ) -> Tuple[
+        Optional[BatteryData],
+        Optional[PVData],
+        Optional[GridData],
+        Optional[OutputData],
+        Optional[SystemStatus],
+    ]:
+        """Fetch and parse QPIGS/QPIGS2/QMOD/QPIWS/QPIRI ASCII data."""
+        commands = ["QPIGS", "QPIGS2", "QMOD", "QPIWS", "QPIRI"]
+        requests = [create_ascii_request(self._get_next_transaction_id(), 0x0001, cmd) for cmd in commands]
+        responses = await self.client.send_bulk(requests)
+        if not responses or len(responses) < len(commands):
+            raise ValueError("Failed to get ASCII responses")
 
-    @staticmethod
-    def _ack_ok(reply: str) -> bool:
-        return reply.startswith("(ACK")
+        raw_qpigs = decode_ascii_response(responses[0])
+        raw_qpigs2 = decode_ascii_response(responses[1])
+        raw_qmod = decode_ascii_response(responses[2])
+        raw_qpiws = decode_ascii_response(responses[3])
+        raw_qpiri = decode_ascii_response(responses[4])
 
-    async def apply_setting(self, command: str) -> bool:
-        """
-        Send a raw ASCII setting (e.g. POP00, PBFT54.0). Returns True on ACK.
-        """
-        packet = create_ascii_request(self._get_next_transaction_id(), 0x0001, command)
-        resp = await self.client.send_ascii_command(packet)
-        if not resp:
-            return False
-        payload = self._safe_decode(resp) or ""
-        _LOGGER.debug("apply_setting(%s) -> %s", command, payload)
-        return self._ack_ok(payload)
+        if not raw_qpigs or not raw_qmod:
+            raise ValueError("Invalid ASCII responses")
 
-    # Convenience typed helpers (accept str or int where applicable)
-    async def set_output_source_priority(self, mode: str | int) -> bool:
-        mapping = {
-            "utilitysolarb at": "00", "utility_solar_bat": "00", "utilitysolarbat": "00", 0: "00",
-            "solar_utility_bat": "01", "solarutilitybat": "01", 1: "01",
-            "solar_bat_utility": "02", "solarbatutility": "02", 2: "02",
-        }
-        k = str(mode).replace(" ", "").lower()
-        if isinstance(mode, int):
-            code = mapping.get(mode)
+        qpigs = raw_qpigs.lstrip("(").split()
+        qpigs2 = raw_qpigs2.lstrip("(").split() if raw_qpigs2 else []
+        qpiws = raw_qpiws.lstrip("(").strip() if raw_qpiws else ""
+        qpiri = raw_qpiri.lstrip("(").split() if raw_qpiri else []
+        qmod = raw_qmod.lstrip("(").strip()
+
+        if len(qpigs) < 21:
+            raise ValueError("Unexpected QPIGS format")
+
+        vals: Dict[str, Any] = {}
+
+        # -------- QPIGS (runtime) --------
+        # 0..6 grid/output basic
+        vals["grid_voltage"] = float(qpigs[0])
+        vals["grid_frequency"] = float(qpigs[1]) * 100
+        vals["output_voltage"] = float(qpigs[2])
+        vals["output_frequency"] = float(qpigs[3]) * 100
+        vals["output_apparent_power"] = int(float(qpigs[4]))
+        vals["output_power"] = int(float(qpigs[5]))
+        vals["output_load_percentage"] = int(float(qpigs[6]))
+
+        # 7 bus voltage
+        vals["bus_voltage"] = float(qpigs[7])
+
+        # Battery metrics
+        vals["battery_voltage"] = float(qpigs[8])
+        battery_chg = float(qpigs[9])                # A
+        vals["battery_charge_current"] = battery_chg
+        vals["battery_soc"] = int(float(qpigs[10]))  # %
+        # Inverter heat sink temp (treat as "inverter temp")
+        vals["battery_temperature"] = int(float(qpigs[11]))
+        # PV1 I/V (also SCC batt voltage)
+        pv1_curr = float(qpigs[12])
+        pv1_volt = float(qpigs[13])
+        vals["battery_voltage_scc"] = float(qpigs[14])
+        battery_dis = float(qpigs[15])
+        vals["battery_discharge_current"] = battery_dis
+        vals["device_status_flags"] = qpigs[16]
+        vals["battery_voltage_offset_for_fans"] = float(qpigs[17])
+        vals["eeprom_version"] = qpigs[18]
+        # PV1 charge power (some firmwares return kW with a dot)
+        raw_pv1_power = qpigs[19]
+        pv1_power = int(float(raw_pv1_power) * 1000) if "." in raw_pv1_power else int(float(raw_pv1_power))
+        vals["device_status_flags2"] = qpigs[20]
+
+        # Battery combined values
+        vals["battery_current"] = battery_chg - battery_dis
+        vals["battery_power"] = int(vals["battery_voltage"] * vals["battery_current"])
+
+        # PV aggregates
+        vals["pv1_current"] = pv1_curr
+        vals["pv1_voltage"] = pv1_volt
+        vals["pv1_power"] = pv1_power
+        vals["pv_total_power"] = pv1_power
+        vals["pv_charging_power"] = pv1_power
+        vals["pv_charging_current"] = pv1_curr
+
+        # -------- QPIGS2 (PV2 if present) --------
+        if len(qpigs2) >= 3:
+            pv2_curr = float(qpigs2[0])
+            pv2_volt = float(qpigs2[1])
+            raw_pv2_power = qpigs2[2]
+            pv2_power = int(float(raw_pv2_power) * 1000) if "." in raw_pv2_power else int(float(raw_pv2_power))
+            vals["pv2_current"] = pv2_curr
+            vals["pv2_voltage"] = pv2_volt
+            vals["pv2_power"] = pv2_power
+            vals["pv_total_power"] += pv2_power
+            vals["pv_charging_power"] += pv2_power
+            vals["pv_charging_current"] += pv2_curr
         else:
-            code = mapping.get(k)
-        if code is None:
-            raise ValueError("Invalid output source priority")
-        return await self.apply_setting(f"POP{code}")
+            vals["pv2_current"] = 0.0
+            vals["pv2_voltage"] = 0.0
+            vals["pv2_power"] = 0
 
-    async def set_charger_source_priority(self, mode: str | int) -> bool:
-        mapping = {"solarfirst": "01", 1: "01", "solarutility": "02", "solar_plus_utility": "02", 2: "02", "onlysolarcharging": "03", "only_solar": "03", 3: "03"}
-        k = str(mode).replace(" ", "").lower()
-        code = mapping.get(mode if isinstance(mode, int) else k)
-        if code is None:
-            raise ValueError("Invalid charger source priority")
-        return await self.apply_setting(f"PCP{code}")
+        # Grid import only (simple estimate)
+        net = vals["output_power"] + vals["battery_power"] - vals["pv_charging_power"]
+        vals["grid_power"] = max(0, int(net))
 
-    async def set_grid_working_range(self, mode: str | int) -> bool:
-        mapping = {"appliance": "00", 0: "00", "ups": "01", 1: "01"}
-        k = str(mode).lower()
-        code = mapping.get(mode if isinstance(mode, int) else k)
-        if code is None:
-            raise ValueError("Invalid grid working range")
-        return await self.apply_setting(f"PGR{code}")
+        # Output current (A) ≈ S / V
+        try:
+            vals["output_current"] = round(
+                (vals["output_apparent_power"] / vals["output_voltage"]) if vals["output_voltage"] > 0 else 0.0, 1
+            )
+        except Exception:
+            vals["output_current"] = None
 
-    async def set_battery_type(self, battery_type: str | int) -> bool:
-        mapping = {"agm": "00", 0: "00", "flooded": "01", 1: "01", "user": "02", 2: "02", "pyl": "03", "pylontech": "03", 3: "03"}
-        k = str(battery_type).lower()
-        code = mapping.get(battery_type if isinstance(battery_type, int) else k)
-        if code is None:
-            raise ValueError("Invalid battery type")
-        return await self.apply_setting(f"PBT{code}")
+        # No ASCII energy counters
+        vals["pv_energy_today"] = None
+        vals["pv_energy_total"] = None
 
-    async def set_output_mode(self, mode: str | int) -> bool:
-        mapping = {"single": "00", 0: "00", "parallel": "01", 1: "01", "p1_3ph": "02", 2: "02", "p2_3ph": "03", 3: "03", "p3_3ph": "04", 4: "04", "p1_2ph": "05", 5: "05", "p2_2ph_120": "06", 6: "06", "p2_2ph_180": "07", 7: "07"}
-        k = str(mode).lower()
-        code = mapping.get(mode if isinstance(mode, int) else k)
-        if code is None:
-            raise ValueError("Invalid output mode")
-        return await self.apply_setting(f"POPM{code}")
+        # -------- QPIWS (warnings) --------
+        if qpiws:
+            bits = qpiws.strip()
+            vals["warnings"] = self._decode_qpiws(bits)
 
-    async def set_rated_output_voltage(self, volts: int) -> bool:
-        v = int(volts)
-        if v not in (110, 120, 127, 220, 230, 240):
-            raise ValueError("Output voltage must be one of 110,120,127,220,230,240")
-        return await self.apply_setting(f"V{v:03d}")
+        # -------- QMOD (operating mode) --------
+        if qmod in ["L", "C"]:
+            vals["operation_mode"] = OperatingMode.SUB.value
+            vals["mode_name"] = "Line Mode" if qmod == "L" else "Charging Mode"
+        elif qmod == "B":
+            vals["operation_mode"] = OperatingMode.SBU.value
+            vals["mode_name"] = "Battery Mode"
+        else:
+            vals["operation_mode"] = OperatingMode.FAULT.value
+            vals["mode_name"] = f"UNKNOWN ({qmod})"
 
-    async def set_rated_output_frequency(self, hz: int | str) -> bool:
-        v = int(hz)
-        if v not in (50, 60):
-            raise ValueError("Output frequency must be 50 or 60")
-        return await self.apply_setting(f"F{v:02d}")
+        # -------- QPIRI (ratings/settings) --------
+        if qpiri:
+            vals.update(self._map_qpiri(qpiri))
 
-    async def set_max_charging_current(self, amps: int, parallel_id: int = 0) -> bool:
-        a = int(amps)
-        if not (0 <= a <= 150):
-            raise ValueError("Max charging current must be 0..150 A")
-        m = int(parallel_id)
-        if not (0 <= m <= 9):
-            raise ValueError("Parallel id must be 0..9")
-        return await self.apply_setting(f"MNCHGC{m:d}{a:03d}")
+        # -------- Build dataclasses --------
+        battery = self._create_battery_data(vals)
+        pv = self._create_pv_data(vals)
+        grid = self._create_grid_data(vals)
+        output = self._create_output_data(vals)
+        system = self._create_system_status(vals)
+        return battery, pv, grid, output, system
 
-    async def set_max_utility_charging_current(self, amps: int, parallel_id: int = 0) -> bool:
-        a = int(amps)
-        if not (0 <= a <= 30):
-            raise ValueError("Utility max charging current must be 0..30 A")
-        m = int(parallel_id)
-        if not (0 <= m <= 9):
-            raise ValueError("Parallel id must be 0..9")
-        candidates = [
-            f"MUCHGC{m:d}{a:03d}",  # 020, 100, 120
-            f"MUCHGC{m:d}{a:02d}",  # 20
-            f"MUCHGC{a:03d}",       # 020 (no parallel)
-            f"MUCHGC{a:02d}",       # 20  (no parallel)
-            f"MUCHGC{a}",           # 2 / 10 / 120
-        ]
-        for cmd in candidates:
-            ok = await self.apply_setting(cmd)
-            _LOGGER.debug("MUCHGC try %s -> %s", cmd, ok)
-            if ok:
-                _LOGGER.info("MUCHGC accepted format: %s", cmd)
-                return True
-        return False
+    # ------------- Public entry point -------------
 
-    async def set_battery_recharge_voltage(self, volts: float) -> bool:
-        v = float(volts)
-        if not (22.0 <= v <= 62.0):
-            raise ValueError("Recharge voltage out of safe range (24V:22.0–28.5 / 48V:44.0–51.0 typical)")
-        return await self.apply_setting(f"PBCV{v:04.1f}")
+    async def get_all_data(
+        self,
+    ) -> Tuple[
+        Optional[BatteryData],
+        Optional[PVData],
+        Optional[GridData],
+        Optional[OutputData],
+        Optional[SystemStatus],
+    ]:
+        """Fetch all data for current model."""
+        if self.model == "VOLTRONIC_ASCII":
+            return await self._get_all_data_ascii()
 
-    async def set_battery_redischarge_voltage(self, volts: float) -> bool:
-        v = float(volts)
-        if v == 0.0:
-            return await self.apply_setting("PBDV00.0")
-        if not (24.0 <= v <= 62.0):
-            raise ValueError("Re-discharge voltage must be 24.0–62.0 V or 0.0")
-        return await self.apply_setting(f"PBDV{v:04.1f}")
+        # Modbus branch (unchanged)
+        register_groups: List[Tuple[int, int]] = []
+        current_group: Optional[Tuple[int, int]] = None
 
-    async def set_battery_cutoff_voltage(self, volts: float) -> bool:
-        v = float(volts)
-        if not (36.0 <= v <= 48.0):
-            raise ValueError("Cut-off voltage must be ~42.0–48.0 V for 48V systems")
-        return await self.apply_setting(f"PSDV{v:04.1f}")
+        registers = sorted(
+            set(
+                self.model_config.get_address(name)
+                for name in self.model_config.register_map.keys()
+                if self.model_config.get_address(name) not in (None, 0)
+            )
+        )
 
-    async def set_battery_bulk_voltage(self, volts: float) -> bool:
-        v = float(volts)
-        if v == 0.0:
-            return await self.apply_setting("PCVV00.0")
-        if not (24.0 <= v <= 64.0):
-            raise ValueError("Bulk/CV voltage must be 24.0–64.0 or 0.0")
-        return await self.apply_setting(f"PCVV{v:04.1f}")
+        for reg in registers:
+            if current_group is None:
+                current_group = (reg, 1)
+            elif reg == current_group[0] + current_group[1]:
+                current_group = (current_group[0], current_group[1] + 1)
+            else:
+                register_groups.append(current_group)
+                current_group = (reg, 1)
+        if current_group:
+            register_groups.append(current_group)
+        if not register_groups:
+            _LOGGER.warning("No registers defined for model")
+            return None, None, None, None, None
 
-    async def set_battery_float_voltage(self, volts: float) -> bool:
-        v = float(volts)
-        if v == 0.0:
-            return await self.apply_setting("PBFT00.0")
-        if not (24.0 <= v <= 64.0):
-            raise ValueError("Float voltage must be 24.0–64.0 or 0.0")
-        return await self.apply_setting(f"PBFT{v:04.1f}")
+        _LOGGER.debug(f"Optimized register groups: {register_groups}")
+        decoded_groups = await self._read_registers_bulk(register_groups)
+        all_values: List[int] = []
+        for group in decoded_groups:
+            if group is not None:
+                all_values.extend(group)
 
-    async def set_cv_stage_max_time(self, minutes: int) -> bool:
-        m = int(minutes)
-        if not (0 <= m <= 900) or m % 5 != 0:
-            raise ValueError("CV stage max time must be 0..900 in steps of 5")
-        return await self.apply_setting(f"PCVT{m:03d}")
+        reg_to_value: Dict[int, int] = {}
+        current_reg = register_groups[0][0]
+        for value in all_values:
+            reg_to_value[current_reg] = value
+            current_reg += 1
 
-    async def set_datetime(self) -> bool:
-        from datetime import datetime
-        return await self.apply_setting(datetime.now().strftime("DAT%y%m%d%H%M%S"))
+        processed_values: Dict[str, Any] = {}
+        for reg_name, config in self.model_config.register_map.items():
+            addr = config.address
+            if addr and addr in reg_to_value:
+                raw_value = reg_to_value[addr]
+                processed_values[reg_name] = (
+                    config.processor(raw_value) if config.processor else raw_value * config.scale_factor
+                )
+        _LOGGER.debug(f"Processed values: {processed_values}")
 
-    async def reset_pv_load_energy(self) -> bool:
-        return await self.apply_setting("RTEY")
+        battery = self._create_battery_data(processed_values)
+        pv = self._create_pv_data(processed_values)
+        grid = self._create_grid_data(processed_values)
+        output = self._create_output_data(processed_values)
+        status = self._create_system_status(processed_values)
+        return battery, pv, grid, output, status
 
-    async def erase_data_log(self) -> bool:
-        return await self.apply_setting("RTDL")
+    # ------------- Builders -------------
 
-    async def equalization_enable(self, enabled: bool) -> bool:
-        return await self.apply_setting(f"PBEQE{1 if enabled else 0}")
+    def _create_battery_data(self, values: Dict[str, Any]) -> Optional[BatteryData]:
+        try:
+            if any(key in values for key in ["battery_voltage", "battery_current", "battery_soc"]):
+                return BatteryData(
+                    voltage=values.get("battery_voltage"),
+                    current=values.get("battery_current"),
+                    power=values.get("battery_power"),
+                    soc=values.get("battery_soc"),
+                    temperature=values.get("battery_temperature"),
+                    charge_current=values.get("battery_charge_current"),
+                    discharge_current=values.get("battery_discharge_current"),
+                    voltage_scc=values.get("battery_voltage_scc"),
+                    voltage_offset_for_fans=values.get("battery_voltage_offset_for_fans"),
+                    eeprom_version=values.get("eeprom_version"),
+                )
+        except Exception as e:
+            _LOGGER.warning(f"Failed to create BatteryData: {e}")
+        return None
 
-    async def equalization_set_time(self, minutes: int) -> bool:
-        m = int(minutes)
-        if not (5 <= m <= 900) or m % 5 != 0:
-            raise ValueError("Equalization time must be 5..900, step 5")
-        return await self.apply_setting(f"PBEQT{m:03d}")
+    def _create_pv_data(self, values: Dict[str, Any]) -> Optional[PVData]:
+        try:
+            if any(key in values for key in ["pv_total_power", "pv_charging_power"]):
+                return PVData(
+                    total_power=values.get("pv_total_power"),
+                    charging_power=values.get("pv_charging_power"),
+                    charging_current=values.get("pv_charging_current"),
+                    temperature=None,  # We no longer expose PV temperature separately
+                    pv1_voltage=values.get("pv1_voltage"),
+                    pv1_current=values.get("pv1_current"),
+                    pv1_power=values.get("pv1_power"),
+                    pv2_voltage=values.get("pv2_voltage"),
+                    pv2_current=values.get("pv2_current"),
+                    pv2_power=values.get("pv2_power"),
+                    pv_generated_today=values.get("pv_energy_today"),
+                    pv_generated_total=values.get("pv_energy_total"),
+                )
+        except Exception as e:
+            _LOGGER.warning(f"Failed to create PVData: {e}")
+        return None
 
-    async def equalization_set_period(self, days: int) -> bool:
-        d = int(days)
-        if not (0 <= d <= 90):
-            raise ValueError("Equalization period must be 0..90 days")
-        return await self.apply_setting(f"PBEQP{d:03d}")
+    def _create_grid_data(self, values: Dict[str, Any]) -> Optional[GridData]:
+        try:
+            if any(key in values for key in ["grid_voltage", "grid_power", "grid_frequency"]):
+                return GridData(
+                    voltage=values.get("grid_voltage"),
+                    power=values.get("grid_power"),
+                    frequency=values.get("grid_frequency"),
+                )
+        except Exception as e:
+            _LOGGER.warning(f"Failed to create GridData: {e}")
+        return None
 
-    async def equalization_set_voltage(self, volts: float) -> bool:
-        v = float(volts)
-        if not (24.0 <= v <= 64.0):
-            raise ValueError("Equalization voltage must be 24.00–64.00 V")
-        return await self.apply_setting(f"PBEQV{v:05.2f}")
+    def _create_output_data(self, values: Dict[str, Any]) -> Optional[OutputData]:
+        try:
+            if any(key in values for key in ["output_voltage", "output_power"]):
+                return OutputData(
+                    voltage=values.get("output_voltage"),
+                    current=values.get("output_current"),
+                    power=values.get("output_power"),
+                    apparent_power=values.get("output_apparent_power"),
+                    load_percentage=values.get("output_load_percentage"),
+                    frequency=values.get("output_frequency"),
+                )
+        except Exception as e:
+            _LOGGER.warning(f"Failed to create OutputData: {e}")
+        return None
 
-    async def equalization_set_over_time(self, minutes: int) -> bool:
-        m = int(minutes)
-        if not (5 <= m <= 900) or m % 5 != 0:
-            raise ValueError("Equalization overtime must be 5..900, step 5")
-        return await self.apply_setting(f"PBEQOT{m:03d}")
+    def _create_system_status(self, values: Dict[str, Any]) -> Optional[SystemStatus]:
+        try:
+            if "operation_mode" in values:
+                mode_value = int(values.get("operation_mode"))
+                try:
+                    op_mode = OperatingMode(mode_value)
+                except ValueError:
+                    op_mode = OperatingMode.FAULT
 
-    async def equalization_activate_now(self, active: bool) -> bool:
-        return await self.apply_setting(f"PBEQA{1 if active else 0}")
-
-    async def battery_control(self, discharge_full_on: int, discharge_on_standby_allowed: int, charge_full_on: int) -> bool:
-        for x in (discharge_full_on, discharge_on_standby_allowed, charge_full_on):
-            if x not in (0, 1):
-                raise ValueError("PBATCD flags must be 0 or 1")
-        return await self.apply_setting(f"PBATCD{discharge_full_on}{discharge_on_standby_allowed}{charge_full_on}")
-
-    async def set_max_discharge_current(self, amps: int) -> bool:
-        a = int(amps)
-        if a == 0:
-            return await self.apply_setting("PBATMAXDISC000")
-        if not (30 <= a <= 150):
-            raise ValueError("Max discharge current must be 30..150 A (or 0 to disable)")
-        return await self.apply_setting(f"PBATMAXDISC{a:03d}")
+                return SystemStatus(
+                    operating_mode=op_mode,
+                    mode_name=values.get("mode_name"),
+                    inverter_time=values.get("inverter_time"),
+                    warnings=values.get("warnings"),
+                    device_status_flags=values.get("device_status_flags"),
+                    device_status_flags2=values.get("device_status_flags2"),
+                    bus_voltage=values.get("bus_voltage"),
+                    grid_rating_voltage=values.get("grid_rating_voltage"),
+                    grid_rating_current=values.get("grid_rating_current"),
+                    ac_output_rating_voltage=values.get("ac_output_rating_voltage"),
+                    ac_output_rating_frequency=values.get("ac_output_rating_frequency"),
+                    ac_output_rating_current=values.get("ac_output_rating_current"),
+                    ac_output_rating_apparent_power=values.get("ac_output_rating_apparent_power"),
+                    ac_output_rating_active_power=values.get("ac_output_rating_active_power"),
+                    battery_rating_voltage=values.get("battery_rating_voltage"),
+                    battery_recharge_voltage=values.get("battery_recharge_voltage"),
+                    battery_undervoltage=values.get("battery_undervoltage"),
+                    battery_bulk_voltage=values.get("battery_bulk_voltage"),
+                    battery_float_voltage=values.get("battery_float_voltage"),
+                    battery_type=values.get("battery_type"),
+                    max_ac_charging_current=values.get("max_ac_charging_current"),
+                    max_charging_current=values.get("max_charging_current"),
+                    input_voltage_range=values.get("input_voltage_range"),
+                    output_source_priority=values.get("output_source_priority"),
+                    charger_source_priority=values.get("charger_source_priority"),
+                    parallel_max_num=values.get("parallel_max_num"),
+                    machine_type=values.get("machine_type"),
+                    topology=values.get("topology"),
+                    output_mode_qpiri=values.get("output_mode_qpiri"),
+                    battery_redischarge_voltage=values.get("battery_redischarge_voltage"),
+                    pv_ok_condition=values.get("pv_ok_condition"),
+                    pv_power_balance=values.get("pv_power_balance"),
+                    max_charging_time_cv=values.get("max_charging_time_cv"),
+                    max_discharging_current=values.get("max_discharging_current"),
+                )
+        except Exception as e:
+            _LOGGER.warning(f"Failed to create SystemStatus: {e}")
+        return None
