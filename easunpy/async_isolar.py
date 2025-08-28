@@ -518,7 +518,20 @@ class AsyncISolar:
         m = int(parallel_id)
         if not (0 <= m <= 9):
             raise ValueError("Parallel id must be 0..9")
-        return await self.apply_setting(f"MUCHGC{m:d}{a:02d}")
+        candidates = [
+            f"MUCHGC{m:d}{a:03d}",  # 020, 100, 120
+            f"MUCHGC{m:d}{a:02d}",  # 20
+            f"MUCHGC{a:03d}",       # 020 (no parallel)
+            f"MUCHGC{a:02d}",       # 20  (no parallel)
+            f"MUCHGC{a}",           # 2 / 10 / 120
+        ]
+        for cmd in candidates:
+            ok = await self.apply_setting(cmd)
+            _LOGGER.debug("MUCHGC try %s -> %s", cmd, ok)
+            if ok:
+                _LOGGER.info("MUCHGC accepted format: %s", cmd)
+                return True
+        return False
 
     async def set_battery_recharge_voltage(self, volts: float) -> bool:
         v = float(volts)
