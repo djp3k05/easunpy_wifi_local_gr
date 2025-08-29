@@ -121,7 +121,7 @@ class AsyncISolar:
             return {"00": "Grid tie", "01": "Off Grid", "10": "Hybrid"}.get(code, code)
 
         def map_charger_priority(code: str) -> str:
-            return {"1": "Solar first", "2": "Solar + Utility", "3": "Only solar charging permitted"}.get(code, code)
+            return {"1": "Solar first", "2": "Solar + Utility", "3": "Only solar charging"}.get(code, code)
 
         def map_output_mode(code: str) -> str:
             return {
