@@ -38,6 +38,7 @@ class DataCollector:
     def __init__(self, isolar: AsyncISolar):
         self._isolar = isolar
         self._data: dict = {}
+        self._stable: dict = {'battery': {}, 'pv': {}, 'grid': {}, 'output': {}, 'system': {}}
         self._lock = asyncio.Lock()
         self._consecutive_failures = 0
         self._max_consecutive_failures = 5
