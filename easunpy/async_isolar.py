@@ -1,3 +1,4 @@
+
 import logging
 from typing import Optional, Dict, Tuple, Any, List
 from .async_modbusclient import AsyncModbusClient
@@ -197,8 +198,7 @@ class AsyncISolar:
     ]:
         """Fetch and parse QPIGS/QPIGS2/QMOD/QPIWS/QPIRI ASCII data."""
         commands = ["QPIGS", "QPIGS2", "QMOD", "QPIWS", "QPIRI"]
-        requests = [create_ascii_request(self._get_next_transaction_id(), 0x0001, cmd) for cmd in commands]
-                # Build per-request packets and map TID -> index to keep alignment when loss/reordering occurs
+        # Build per-request packets and map TID -> index to keep alignment when loss/reordering occurs
         reqs = []
         tid_to_index: dict[int, int] = {}
         for i, cmd in enumerate(commands):
@@ -209,13 +209,13 @@ class AsyncISolar:
         responses = await self.client.send_bulk(reqs)
         if not responses:
             raise ValueError("Failed to get ASCII responses")
-        
+
         def _decode_ok(resp: bytes) -> str | None:
             s = decode_ascii_response(resp)
             if not s or not s.startswith("(") or s.startswith("(NAK"):
                 return None
             return s
-        
+
         def _extract_tid(resp: bytes) -> int | None:
             try:
                 if resp and len(resp) >= 2:
@@ -223,7 +223,7 @@ class AsyncISolar:
             except Exception:
                 return None
             return None
-        
+
         responses_ascii: list[str | None] = [None] * len(commands)
         for r in (responses or []):
             idx = tid_to_index.get(_extract_tid(r))
@@ -231,33 +231,27 @@ class AsyncISolar:
                 s = _decode_ok(r)
                 if s is not None:
                     responses_ascii[idx] = s
-        
+
         raw_qpigs  = responses_ascii[0]
         raw_qpigs2 = responses_ascii[1]
         raw_qmod   = responses_ascii[2]
         raw_qpiws  = responses_ascii[3]
         raw_qpiri  = responses_ascii[4]
-        
+
         # Guard essentials; skip this cycle if core frames missing (stable cache keeps last good)
         if not raw_qpigs or not raw_qmod:
             raise ValueError("Invalid ASCII responses")
-        
+
         # Tokenize safely
         qpigs  = raw_qpigs.lstrip("(").split()
         qpigs2 = raw_qpigs2.lstrip("(").split() if raw_qpigs2 else []
         qpiws  = raw_qpiws.lstrip("(").strip()  if raw_qpiws  else ""
         qpiri  = raw_qpiri.lstrip("(").split()  if raw_qpiri  else []
         qmod   = raw_qmod.lstrip("(").strip()
-        
+
         # QMOD is a single alpha like 'L'/'B'/'C'; if not, ignore for this cycle
         if len(qmod) != 1 or not qmod.isalpha():
             qmod = ""
-
-        qpigs = raw_qpigs.lstrip("(").split()
-        qpigs2 = raw_qpigs2.lstrip("(").split() if raw_qpigs2 else []
-        qpiws = raw_qpiws.lstrip("(").strip() if raw_qpiws else ""
-        qpiri = raw_qpiri.lstrip("(").split() if raw_qpiri else []
-        qmod = raw_qmod.lstrip("(").strip()
 
         if len(qpigs) < 21:
             raise ValueError("Unexpected QPIGS format")
@@ -558,6 +552,8 @@ class AsyncISolar:
                 )
         except Exception as e:
             _LOGGER.warning(f"Failed to create SystemStatus: {e}")
+        return None
+
     # ------------- ASCII setting helpers -------------
 
     async def _apply_ascii_setting(self, cmd: str) -> bool:
@@ -648,4 +644,39 @@ class AsyncISolar:
             return False
         return await self._apply_ascii_setting(cmd)
 
-        return None
+    # ------------- NEW: Battery voltage setters used by Select dropdowns -------------
+
+    async def set_battery_bulk_voltage(self, volts: float) -> bool:
+        try:
+            v = float(volts)
+        except Exception:
+            return False
+        return await self._apply_ascii_setting(f"PCVV{v:.1f}")
+
+    async def set_battery_cutoff_voltage(self, volts: float) -> bool:
+        try:
+            v = float(volts)
+        except Exception:
+            return False
+        return await self._apply_ascii_setting(f"PSDV{v:.1f}")
+
+    async def set_battery_float_voltage(self, volts: float) -> bool:
+        try:
+            v = float(volts)
+        except Exception:
+            return False
+        return await self._apply_ascii_setting(f"PBFT{v:.1f}")
+
+    async def set_battery_recharge_voltage(self, volts: float) -> bool:
+        try:
+            v = float(volts)
+        except Exception:
+            return False
+        return await self._apply_ascii_setting(f"PBCV{v:.1f}")
+
+    async def set_battery_redischarge_voltage(self, volts: float) -> bool:
+        try:
+            v = float(volts)
+        except Exception:
+            return False
+        return await self._apply_ascii_setting(f"PBDV{v:.1f}")
