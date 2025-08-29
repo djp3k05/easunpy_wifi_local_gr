@@ -168,6 +168,7 @@ class OutputModeSelect(_BaseSelect):
         }
         if str(value) in friendly:
             return str(value)
+        
         code_map = {
             "00": "Single machine output",
             "01": "Parallel output",
@@ -177,6 +178,16 @@ class OutputModeSelect(_BaseSelect):
             "05": "Phase 1 of 2 Phase output",
             "06": "Phase 2 of 2 Phase output (120°)",
             "07": "Phase 2 of 2 Phase output (180°)",
+            # Some firmwares report single-digit codes:
+            "0": "Single machine output",
+            "1": "Parallel output",
+            "2": "Phase 1 of 3 Phase output",
+            "3": "Phase 2 of 3 Phase output",
+            "4": "Phase 3 of 3 Phase output",
+            "5": "Phase 1 of 2 Phase output",
+            "6": "Phase 2 of 2 Phase output (120°)",
+            "7": "Phase 2 of 2 Phase output (180°)",
+            # Friendly tokens we might store internally:
             "single": "Single machine output",
             "parallel": "Parallel output",
             "p1_3ph": "Phase 1 of 3 Phase output",
