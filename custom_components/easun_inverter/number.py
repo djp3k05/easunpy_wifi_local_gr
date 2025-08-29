@@ -1,6 +1,6 @@
-# easun_inverter/number.py
 
-"""Number entities to change numeric inverter settings."""
+# easun_inverter/number.py
+"""Number entities to change numeric inverter settings (non-voltage)."""
 from __future__ import annotations
 
 import logging
@@ -67,55 +67,7 @@ class _BaseNumber(NumberEntity):
         return self._coordinator._isolar, self._coordinator
 
 
-class BatteryRechargeVoltage(_BaseNumber):
-    async def async_set_native_value(self, value: float) -> None:
-        isolar, coord = await self._get_isolar()
-        if not isolar: return
-        ok = await isolar.set_battery_recharge_voltage(value)
-        coord.update_last_command_status(ok)
-        _LOGGER.info("Set Battery Re-Charge Voltage -> %s", ok)
-        if ok: await coord.update_data()
-
-
-class BatteryRedischargeVoltage(_BaseNumber):
-    async def async_set_native_value(self, value: float) -> None:
-        isolar, coord = await self._get_isolar()
-        if not isolar: return
-        ok = await isolar.set_battery_redischarge_voltage(value)
-        coord.update_last_command_status(ok)
-        _LOGGER.info("Set Battery Re-Discharge Voltage -> %s", ok)
-        if ok: await coord.update_data()
-
-
-class BatteryCutoffVoltage(_BaseNumber):
-    async def async_set_native_value(self, value: float) -> None:
-        isolar, coord = await self._get_isolar()
-        if not isolar: return
-        ok = await isolar.set_battery_cutoff_voltage(value)
-        coord.update_last_command_status(ok)
-        _LOGGER.info("Set Battery Cut-Off Voltage -> %s", ok)
-        if ok: await coord.update_data()
-
-
-class BatteryBulkVoltage(_BaseNumber):
-    async def async_set_native_value(self, value: float) -> None:
-        isolar, coord = await self._get_isolar()
-        if not isolar: return
-        ok = await isolar.set_battery_bulk_voltage(value)
-        coord.update_last_command_status(ok)
-        _LOGGER.info("Set Battery Bulk/CV Voltage -> %s", ok)
-        if ok: await coord.update_data()
-
-
-class BatteryFloatVoltage(_BaseNumber):
-    async def async_set_native_value(self, value: float) -> None:
-        isolar, coord = await self._get_isolar()
-        if not isolar: return
-        ok = await isolar.set_battery_float_voltage(value)
-        coord.update_last_command_status(ok)
-        _LOGGER.info("Set Battery Float Voltage -> %s", ok)
-        if ok: await coord.update_data()
-
+# --- Remaining number entities (keep) ---
 
 class CVStageMaxTime(_BaseNumber):
     async def async_set_native_value(self, value: float) -> None:
@@ -137,6 +89,8 @@ class MaxDischargeCurrent(_BaseNumber):
         _LOGGER.info("Set Max Discharge Current -> %s", ok)
         if ok: await coord.update_data()
 
+
+# --- Equalization settings ---
 
 class EqTimeMinutes(_BaseNumber):
     async def async_set_native_value(self, value: float) -> None:
@@ -183,17 +137,8 @@ class EqOvertimeMinutes(_BaseNumber):
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, add_entities: AddEntitiesCallback) -> None:
     coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
     entities: list[NumberEntity] = [
-        # Values adjusted based on your feedback
-        BatteryRechargeVoltage(coordinator, "Battery Re-Charge Voltage", "battery_recharge_voltage", 44.0, 51.0, 0.1, "V"),
-        BatteryRedischargeVoltage(coordinator, "Battery Re-Discharge Voltage", "battery_redischarge_voltage", 48.0, 64.0, 0.1, "V"),
-        BatteryCutoffVoltage(coordinator, "Battery Cut-Off Voltage", "battery_undervoltage", 40.0, 54.0, 0.1, "V"),
-        BatteryBulkVoltage(coordinator, "Battery Bulk/CV Voltage", "battery_bulk_voltage", 48.0, 64.0, 0.1, "V"),
-        BatteryFloatVoltage(coordinator, "Battery Float Voltage", "battery_float_voltage", 48.0, 64.0, 0.1, "V"),
-        
-        # Remaining number entities
         CVStageMaxTime(coordinator, "Max Charging Time at CV", "max_charging_time_cv", 0, 900, 5, "min"),
         MaxDischargeCurrent(coordinator, "Max Discharging Current", "max_discharging_current", 0, 150, 1, "A"),
-        
         # Equalization
         EqTimeMinutes(coordinator, "Equalization Time", "eq_time", 5, 900, 5, "min"),
         EqPeriodDays(coordinator, "Equalization Period", "eq_period", 0, 90, 1, "days"),
