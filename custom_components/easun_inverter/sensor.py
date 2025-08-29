@@ -45,20 +45,36 @@ class DataCollector:
         self._last_successful_update: datetime | None = None
         self._update_timeout = 30
         self._sensors: list[SensorEntity] = []
-        self._entities: list = []  # selects/numbers that want push updates
         _LOGGER.info(f"DataCollector initialized with model: {self._isolar.model}")
 
     def register_sensor(self, sensor: SensorEntity) -> None:
         self._sensors.append(sensor)
         _LOGGER.debug(f"Registered sensor: {sensor.name}")
 
-    def register_entity(self, entity) -> None:
-        """Register a push-updated entity (select/number/etc.)."""
+    def update_last_command_status(self, ok: bool, command: str | None = None) -> None:
+        """Store last command ACK/NAK and push-update the dedicated sensor."""
         try:
-            self._entities.append(entity)
-            _LOGGER.debug(f"Registered entity: {getattr(entity, 'name', entity)}")
+            status = "ACK" if ok else "NAK"
+            msg = f"{status}{f' {command}' if command else ''}"
+            self._stable.setdefault('system', {})
+            self._data.setdefault('system', {})
+            self._stable['system']['last_command_response'] = msg
+            self._data['system']['last_command_response'] = msg
+            try:
+                if hasattr(self, '_notify_sensors'):
+                    self._notify_sensors()
+            except Exception:
+                pass
+            try:
+                if hasattr(self, '_entities'):
+                    for ent in self._entities:
+                        if hasattr(ent, 'update_from_collector'):
+                            ent.update_from_collector()
+            except Exception:
+                pass
+            _LOGGER.debug("Last command response updated: %s", msg)
         except Exception:
-            _LOGGER.debug("Failed to register entity", exc_info=True)
+            _LOGGER.debug("Failed to update last command response", exc_info=True)
 
     async def is_update_stuck(self) -> bool:
         if self._last_update_start is None:
@@ -78,14 +94,7 @@ class DataCollector:
                 await asyncio.wait_for(update_task, timeout=self._update_timeout)
                 for sensor in self._sensors:
                     sensor.update_from_collector()
-                # also push to selects/numbers
-                for ent in self._entities:
-                    try:
-                        if hasattr(ent, 'update_from_collector'):
-                            ent.update_from_collector()
-                    except Exception:
-                        pass
-                _LOGGER.debug("Updated all registered sensors and entities")
+                _LOGGER.debug("Updated all registered sensors")
                 self._last_successful_update = datetime.now()
                 self._consecutive_failures = 0
             except asyncio.TimeoutError:
@@ -117,8 +126,6 @@ class DataCollector:
 
 class EasunSensor(SensorEntity):
     """Representation of an Easun Inverter sensor."""
-    _attr_should_poll = False
-
 
     def __init__(
         self,
@@ -167,11 +174,6 @@ class EasunSensor(SensorEntity):
         if self._converter and value is not None:
             value = self._converter(value)
         self._state = value
-        try:
-            if getattr(self, 'hass', None):
-                self.async_write_ha_state()
-        except Exception:
-            pass
 
 
 class RegisterScanSensor(SensorEntity):
@@ -255,6 +257,7 @@ async def async_setup_entry(
     # Build sensor entities
     # -----------------------------
     entities: list[SensorEntity] = [
+        EasunSensor(data_collector, "last_command_response", "Last Command Response", None, "system", "last_command_response"),
         # Battery runtime
         EasunSensor(data_collector, "battery_voltage", "Battery Voltage", UnitOfElectricPotential.VOLT, "battery", "voltage"),
         EasunSensor(data_collector, "battery_current", "Battery Current", UnitOfElectricCurrent.AMPERE, "battery", "current"),
