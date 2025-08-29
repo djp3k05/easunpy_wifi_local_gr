@@ -45,11 +45,20 @@ class DataCollector:
         self._last_successful_update: datetime | None = None
         self._update_timeout = 30
         self._sensors: list[SensorEntity] = []
+        self._entities: list = []  # selects/numbers that want push updates
         _LOGGER.info(f"DataCollector initialized with model: {self._isolar.model}")
 
     def register_sensor(self, sensor: SensorEntity) -> None:
         self._sensors.append(sensor)
         _LOGGER.debug(f"Registered sensor: {sensor.name}")
+
+    def register_entity(self, entity) -> None:
+        """Register a push-updated entity (select/number/etc.)."""
+        try:
+            self._entities.append(entity)
+            _LOGGER.debug(f"Registered entity: {getattr(entity, 'name', entity)}")
+        except Exception:
+            _LOGGER.debug("Failed to register entity", exc_info=True)
 
     async def is_update_stuck(self) -> bool:
         if self._last_update_start is None:
@@ -69,7 +78,14 @@ class DataCollector:
                 await asyncio.wait_for(update_task, timeout=self._update_timeout)
                 for sensor in self._sensors:
                     sensor.update_from_collector()
-                _LOGGER.debug("Updated all registered sensors")
+                # also push to selects/numbers
+                for ent in self._entities:
+                    try:
+                        if hasattr(ent, 'update_from_collector'):
+                            ent.update_from_collector()
+                    except Exception:
+                        pass
+                _LOGGER.debug("Updated all registered sensors and entities")
                 self._last_successful_update = datetime.now()
                 self._consecutive_failures = 0
             except asyncio.TimeoutError:
