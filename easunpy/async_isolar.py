@@ -353,6 +353,91 @@ class AsyncISolar:
         system = self._create_system_status(vals)
         return battery, pv, grid, output, system
 
+
+    # ------------- ASCII settings (write commands) -------------
+
+    async def _apply_ascii_setting(self, command: str) -> bool:
+        """Send a single ASCII setting command and return True on ACK."""
+        try:
+            req = create_ascii_request(self._get_next_transaction_id(), 0x0001, command)
+            responses = await self.client.send_bulk([req])
+            if not responses:
+                _LOGGER.debug(f"apply_setting({command}) -> no response")
+                return False
+            resp = decode_ascii_response(responses[0])
+            _LOGGER.debug(f"apply_setting({command}) -> {resp}")
+            return bool(resp and resp.startswith("(ACK"))
+        except Exception as e:
+            _LOGGER.warning(f"Failed to apply setting {command}: {e}")
+            return False
+
+    async def set_max_utility_charging_current(self, amps: int) -> bool:
+        """Set Max Utility (AC) Charging Current. Uses MUCHGC#### format (e.g., 0002, 0020)."""
+        try:
+            val = max(0, int(amps))
+        except Exception:
+            return False
+        # Known-working format from logs: MUCHGC0020 / MUCHGC0002
+        cmd = f"MUCHGC{val:04d}"
+        ok = await self._apply_ascii_setting(cmd)
+        if ok:
+            _LOGGER.info(f"MUCHGC accepted format: {cmd}")
+        return ok
+
+    async def set_max_charging_current(self, amps: int) -> bool:
+        """Set Max Charging Current (total). Uses MNCHGC#### format."""
+        try:
+            val = max(0, int(amps))
+        except Exception:
+            return False
+        cmd = f"MNCHGC{val:04d}"
+        return await self._apply_ascii_setting(cmd)
+
+    async def set_output_source_priority(self, option: str) -> bool:
+        """Set Output Source Priority via POP{code} where code in {00,01,02}."""
+        map_code = {
+            "UtilitySolarBat": "00",
+            "SolarUtilityBat": "01",
+            "SolarBatUtility": "02",
+            # also accept raw numeric strings:
+            "0": "00", "1": "01", "2": "02",
+        }
+        code = map_code.get(str(option), None)
+        if code is None:
+            _LOGGER.warning(f"Unknown Output Source Priority: {option}")
+            return False
+        return await self._apply_ascii_setting(f"POP{code}")
+
+    async def set_charger_source_priority(self, option: str) -> bool:
+        """Set Charger Source Priority via PCP{code} where code in {01,02,03}."""
+        map_code = {
+            "Solar first": "01",
+            "Solar + Utility": "02",
+            "Only solar charging": "03",
+            "Only solar charging permitted": "03",
+            # accept raw numeric:
+            "1": "01", "2": "02", "3": "03",
+        }
+        code = map_code.get(str(option), None)
+        if code is None:
+            _LOGGER.warning(f"Unknown Charger Source Priority: {option}")
+            return False
+        return await self._apply_ascii_setting(f"PCP{code}")
+
+    async def set_grid_working_range(self, option: str) -> bool:
+        """Set Input Voltage Range via PGR{code} where code in {00,01} (Appliance/UPS)."""
+        map_code = {
+            "Appliance": "00",
+            "UPS": "01",
+            # accept raw numeric:
+            "0": "00", "1": "01",
+        }
+        code = map_code.get(str(option), None)
+        if code is None:
+            _LOGGER.warning(f"Unknown Grid Working Range (Input Voltage Range): {option}")
+            return False
+        return await self._apply_ascii_setting(f"PGR{code}")
+
     # ------------- Public entry point -------------
 
     async def get_all_data(
