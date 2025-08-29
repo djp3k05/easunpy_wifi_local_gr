@@ -565,7 +565,8 @@ class AsyncISolar:
         try:
             tid = self._get_next_transaction_id()
             pkt = create_ascii_request(tid, 0x0001, cmd)
-            resp = await self.client.send(pkt)
+            resps = await self.client.send_bulk([pkt])
+            resp = resps[0] if resps else None
             ack = decode_ascii_response(resp) if resp else None
             _LOGGER.debug(f"apply_setting({cmd}) -> {ack}")
             return bool(ack) and ack.startswith("(ACK")
