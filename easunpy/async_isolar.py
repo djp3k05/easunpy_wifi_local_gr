@@ -558,4 +558,93 @@ class AsyncISolar:
                 )
         except Exception as e:
             _LOGGER.warning(f"Failed to create SystemStatus: {e}")
+    # ------------- ASCII setting helpers -------------
+
+    async def _apply_ascii_setting(self, cmd: str) -> bool:
+        """Send a single ASCII setting command and return True on ACK."""
+        try:
+            tid = self._get_next_transaction_id()
+            pkt = create_ascii_request(tid, 0x0001, cmd)
+            resp = await self.client.send(pkt)
+            ack = decode_ascii_response(resp) if resp else None
+            _LOGGER.debug(f"apply_setting({cmd}) -> {ack}")
+            return bool(ack) and ack.startswith("(ACK")
+        except Exception as e:
+            _LOGGER.debug(f"apply_setting({cmd}) failed: {e}")
+            return False
+
+    async def set_max_utility_charging_current(self, amps: int) -> bool:
+        """MUCHGC: AC utility charging current (4-digit, zero-padded). E.g., 2 -> MUCHGC0002, 20 -> MUCHGC0020."""
+        try:
+            amps_i = int(amps)
+        except Exception:
+            return False
+        cmd = f"MUCHGC{amps_i:04d}"
+        ok = await self._apply_ascii_setting(cmd)
+        if ok:
+            _LOGGER.info(f"MUCHGC accepted format: {cmd}")
+        return ok
+
+    async def set_max_charging_current(self, amps: int) -> bool:
+        """MNCHGC: Max charging current (battery), 4-digit zero-padded."""
+        try:
+            amps_i = int(amps)
+        except Exception:
+            return False
+        cmd = f"MNCHGC{amps_i:04d}"
+        return await self._apply_ascii_setting(cmd)
+
+    async def set_output_source_priority(self, option: str) -> bool:
+        """POP: Output Source Priority from friendly label."""
+        mapping = {
+            "UtilitySolarBat": "POP00",
+            "SolarUtilityBat": "POP01",
+            "SolarBatUtility": "POP02",
+        }
+        code = mapping.get(option)
+        if not code:
+            _LOGGER.debug(f"set_output_source_priority: unknown option {option}")
+            return False
+        return await self._apply_ascii_setting(code)
+
+    async def set_charger_source_priority(self, option: str) -> bool:
+        """PCP: Charger Source Priority from friendly label."""
+        mapping = {
+            "Solar first": "PCP03",
+            "Solar + Utility": "PCP02",
+            "Only solar charging": "PCP00",
+        }
+        code = mapping.get(option)
+        if not code:
+            _LOGGER.debug(f"set_charger_source_priority: unknown option {option}")
+            return False
+        return await self._apply_ascii_setting(code)
+
+    async def set_grid_working_range(self, option: str) -> bool:
+        """PGR: Input Voltage Range (Appliance/UPS)."""
+        mapping = {"Appliance": "PGR00", "UPS": "PGR01"}
+        code = mapping.get(option)
+        if not code:
+            _LOGGER.debug(f"set_grid_working_range: unknown option {option}")
+            return False
+        return await self._apply_ascii_setting(code)
+
+    async def set_output_mode(self, code: str) -> bool:
+        """POPM: Output Mode (QPIRI-related). Accepts codes like 'single','parallel','p1_3ph','p2_3ph','p3_3ph','p1_2ph','p2_2ph_120','p2_2ph_180'."""
+        mapping = {
+            "single": "POPM00",
+            "parallel": "POPM01",
+            "p1_3ph": "POPM02",
+            "p2_3ph": "POPM03",
+            "p3_3ph": "POPM04",
+            "p1_2ph": "POPM05",
+            "p2_2ph_120": "POPM06",
+            "p2_2ph_180": "POPM07",
+        }
+        cmd = mapping.get(code, None)
+        if cmd is None:
+            _LOGGER.debug(f"set_output_mode: unknown code {code}")
+            return False
+        return await self._apply_ascii_setting(cmd)
+
         return None
