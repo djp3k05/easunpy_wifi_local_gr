@@ -65,6 +65,8 @@ class DataCollector:
         try:
             status = "ACK" if ok else "NAK"
             msg = f"{status}{f' {command}' if command else ''}"
+            if not hasattr(self, '_stable'):
+                self._stable = {'battery': {}, 'pv': {}, 'grid': {}, 'output': {}, 'system': {}}
             self._stable.setdefault('system', {})
             self._data.setdefault('system', {})
             self._stable['system']['last_command_response'] = msg
@@ -130,11 +132,25 @@ class DataCollector:
 
     async def _do_update(self) -> None:
         battery, pv, grid, output, status = await self._isolar.get_all_data()
-        self._data["battery"] = battery.__dict__ if battery else {}
-        self._data["pv"] = pv.__dict__ if pv else {}
-        self._data["grid"] = grid.__dict__ if grid else {}
-        self._data["output"] = output.__dict__ if output else {}
-        self._data["system"] = status.__dict__ if status else {}
+        # Build current dicts from models
+        current = {
+            'battery': (battery.__dict__ if battery else {}),
+            'pv': (pv.__dict__ if pv else {}),
+            'grid': (grid.__dict__ if grid else {}),
+            'output': (output.__dict__ if output else {}),
+            'system': (status.__dict__ if status else {}),
+        }
+        # Merge non-None values into stable cache
+        for section, vals in current.items():
+            for k, v in vals.items():
+                if v is not None:
+                    self._stable[section][k] = v
+        # Expose stable snapshot
+        self._data['battery'] = dict(self._stable['battery'])
+        self._data['pv'] = dict(self._stable['pv'])
+        self._data['grid'] = dict(self._stable['grid'])
+        self._data['output'] = dict(self._stable['output'])
+        self._data['system'] = dict(self._stable['system'])
 
     def get_data(self, section: str, key: str):
         return self._data.get(section, {}).get(key)
