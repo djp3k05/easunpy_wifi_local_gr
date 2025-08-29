@@ -198,51 +198,69 @@ class AsyncISolar:
         """Fetch and parse QPIGS/QPIGS2/QMOD/QPIWS/QPIRI ASCII data."""
         commands = ["QPIGS", "QPIGS2", "QMOD", "QPIWS", "QPIRI"]
         requests = [create_ascii_request(self._get_next_transaction_id(), 0x0001, cmd) for cmd in commands]
-        responses = await self.client.send_bulk(requests)
-
-        # Tolerant decode with one retry for failed commands
-        def _decode_ok(resp):
+                # Build per-request packets and map TID -> index to keep alignment when loss/reordering occurs
+        reqs = []
+        tid_to_index: dict[int, int] = {}
+        for i, cmd in enumerate(commands):
+            tid = self._get_next_transaction_id()
+            pkt = create_ascii_request(tid, 0x0001, cmd)
+            reqs.append(pkt)
+            tid_to_index[tid] = i
+        responses = await self.client.send_bulk(reqs)
+        if not responses:
+            raise ValueError("Failed to get ASCII responses")
+        
+        def _decode_ok(resp: bytes) -> str | None:
             s = decode_ascii_response(resp)
             if not s or not s.startswith("(") or s.startswith("(NAK"):
                 return None
             return s
-
-        if not responses or len(responses) < len(commands):
-            _LOGGER.debug("ASCII bulk returned %s frames for %s commands; continuing with partial data", len(responses) if responses else 0, len(commands))
-            responses = (responses or []) + [b""] * (len(commands) - (len(responses or [])))
-
-        responses_ascii = [_decode_ok(r) for r in responses[:len(commands)]]
-        bad_idx = [i for i, s in enumerate(responses_ascii) if s is None]
-        if bad_idx:
+        
+        def _extract_tid(resp: bytes) -> int | None:
             try:
-                import asyncio
-                await asyncio.sleep(0.15)
-                retry_requests = [requests[i] for i in bad_idx]
-                retry_responses = await self.client.send_bulk(retry_requests)
-                for j, r in enumerate(retry_responses):
-                    s = _decode_ok(r)
-                    if s is not None:
-                        responses_ascii[bad_idx[j]] = s
-            except Exception as _e:
-                _LOGGER.debug("Retry of failed ASCII commands failed: %s", _e)
-
+                if resp and len(resp) >= 2:
+                    return (resp[0] << 8) | resp[1]
+            except Exception:
+                return None
+            return None
+        
+        responses_ascii: list[str | None] = [None] * len(commands)
+        for r in (responses or []):
+            idx = tid_to_index.get(_extract_tid(r))
+            if idx is not None:
+                s = _decode_ok(r)
+                if s is not None:
+                    responses_ascii[idx] = s
+        
         raw_qpigs  = responses_ascii[0]
         raw_qpigs2 = responses_ascii[1]
         raw_qmod   = responses_ascii[2]
         raw_qpiws  = responses_ascii[3]
         raw_qpiri  = responses_ascii[4]
-
+        
+        # Guard essentials; skip this cycle if core frames missing (stable cache keeps last good)
         if not raw_qpigs or not raw_qmod:
-            _LOGGER.debug("Invalid ASCII responses; continuing with partial data this cycle")
+            raise ValueError("Invalid ASCII responses")
+        
+        # Tokenize safely
+        qpigs  = raw_qpigs.lstrip("(").split()
+        qpigs2 = raw_qpigs2.lstrip("(").split() if raw_qpigs2 else []
+        qpiws  = raw_qpiws.lstrip("(").strip()  if raw_qpiws  else ""
+        qpiri  = raw_qpiri.lstrip("(").split()  if raw_qpiri  else []
+        qmod   = raw_qmod.lstrip("(").strip()
+        
+        # QMOD is a single alpha like 'L'/'B'/'C'; if not, ignore for this cycle
+        if len(qmod) != 1 or not qmod.isalpha():
+            qmod = ""
 
-        qpigs = raw_qpigs.lstrip("(").split() if raw_qpigs else []
+        qpigs = raw_qpigs.lstrip("(").split()
         qpigs2 = raw_qpigs2.lstrip("(").split() if raw_qpigs2 else []
         qpiws = raw_qpiws.lstrip("(").strip() if raw_qpiws else ""
         qpiri = raw_qpiri.lstrip("(").split() if raw_qpiri else []
-        qmod = raw_qmod.lstrip("(").strip() if raw_qmod else ""
+        qmod = raw_qmod.lstrip("(").strip()
 
         if len(qpigs) < 21:
-            _LOGGER.debug("Unexpected QPIGS format; skipping this cycle"); return (None, None, None, None, None)
+            raise ValueError("Unexpected QPIGS format")
 
         vals: Dict[str, Any] = {}
 
@@ -352,91 +370,6 @@ class AsyncISolar:
         output = self._create_output_data(vals)
         system = self._create_system_status(vals)
         return battery, pv, grid, output, system
-
-
-    # ------------- ASCII settings (write commands) -------------
-
-    async def _apply_ascii_setting(self, command: str) -> bool:
-        """Send a single ASCII setting command and return True on ACK."""
-        try:
-            req = create_ascii_request(self._get_next_transaction_id(), 0x0001, command)
-            responses = await self.client.send_bulk([req])
-            if not responses:
-                _LOGGER.debug(f"apply_setting({command}) -> no response")
-                return False
-            resp = decode_ascii_response(responses[0])
-            _LOGGER.debug(f"apply_setting({command}) -> {resp}")
-            return bool(resp and resp.startswith("(ACK"))
-        except Exception as e:
-            _LOGGER.warning(f"Failed to apply setting {command}: {e}")
-            return False
-
-    async def set_max_utility_charging_current(self, amps: int) -> bool:
-        """Set Max Utility (AC) Charging Current. Uses MUCHGC#### format (e.g., 0002, 0020)."""
-        try:
-            val = max(0, int(amps))
-        except Exception:
-            return False
-        # Known-working format from logs: MUCHGC0020 / MUCHGC0002
-        cmd = f"MUCHGC{val:04d}"
-        ok = await self._apply_ascii_setting(cmd)
-        if ok:
-            _LOGGER.info(f"MUCHGC accepted format: {cmd}")
-        return ok
-
-    async def set_max_charging_current(self, amps: int) -> bool:
-        """Set Max Charging Current (total). Uses MNCHGC#### format."""
-        try:
-            val = max(0, int(amps))
-        except Exception:
-            return False
-        cmd = f"MNCHGC{val:04d}"
-        return await self._apply_ascii_setting(cmd)
-
-    async def set_output_source_priority(self, option: str) -> bool:
-        """Set Output Source Priority via POP{code} where code in {00,01,02}."""
-        map_code = {
-            "UtilitySolarBat": "00",
-            "SolarUtilityBat": "01",
-            "SolarBatUtility": "02",
-            # also accept raw numeric strings:
-            "0": "00", "1": "01", "2": "02",
-        }
-        code = map_code.get(str(option), None)
-        if code is None:
-            _LOGGER.warning(f"Unknown Output Source Priority: {option}")
-            return False
-        return await self._apply_ascii_setting(f"POP{code}")
-
-    async def set_charger_source_priority(self, option: str) -> bool:
-        """Set Charger Source Priority via PCP{code} where code in {01,02,03}."""
-        map_code = {
-            "Solar first": "01",
-            "Solar + Utility": "02",
-            "Only solar charging": "03",
-            "Only solar charging permitted": "03",
-            # accept raw numeric:
-            "1": "01", "2": "02", "3": "03",
-        }
-        code = map_code.get(str(option), None)
-        if code is None:
-            _LOGGER.warning(f"Unknown Charger Source Priority: {option}")
-            return False
-        return await self._apply_ascii_setting(f"PCP{code}")
-
-    async def set_grid_working_range(self, option: str) -> bool:
-        """Set Input Voltage Range via PGR{code} where code in {00,01} (Appliance/UPS)."""
-        map_code = {
-            "Appliance": "00",
-            "UPS": "01",
-            # accept raw numeric:
-            "0": "00", "1": "01",
-        }
-        code = map_code.get(str(option), None)
-        if code is None:
-            _LOGGER.warning(f"Unknown Grid Working Range (Input Voltage Range): {option}")
-            return False
-        return await self._apply_ascii_setting(f"PGR{code}")
 
     # ------------- Public entry point -------------
 
