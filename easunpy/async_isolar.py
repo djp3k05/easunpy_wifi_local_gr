@@ -199,14 +199,38 @@ class AsyncISolar:
         commands = ["QPIGS", "QPIGS2", "QMOD", "QPIWS", "QPIRI"]
         requests = [create_ascii_request(self._get_next_transaction_id(), 0x0001, cmd) for cmd in commands]
         responses = await self.client.send_bulk(requests)
-        if not responses or len(responses) < len(commands):
-            raise ValueError("Failed to get ASCII responses")
 
-        raw_qpigs = decode_ascii_response(responses[0])
-        raw_qpigs2 = decode_ascii_response(responses[1])
-        raw_qmod = decode_ascii_response(responses[2])
-        raw_qpiws = decode_ascii_response(responses[3])
-        raw_qpiri = decode_ascii_response(responses[4])
+        # Tolerant decode with one retry for failed commands
+        def _decode_ok(resp):
+            s = decode_ascii_response(resp)
+            if not s or not s.startswith("(") or s.startswith("(NAK"):
+                return None
+            return s
+
+        if not responses or len(responses) < len(commands):
+            _LOGGER.debug("ASCII bulk returned %s frames for %s commands; continuing with partial data", len(responses) if responses else 0, len(commands))
+            responses = (responses or []) + [b""] * (len(commands) - (len(responses or [])))
+
+        responses_ascii = [_decode_ok(r) for r in responses[:len(commands)]]
+        bad_idx = [i for i, s in enumerate(responses_ascii) if s is None]
+        if bad_idx:
+            try:
+                import asyncio
+                await asyncio.sleep(0.15)
+                retry_requests = [requests[i] for i in bad_idx]
+                retry_responses = await self.client.send_bulk(retry_requests)
+                for j, r in enumerate(retry_responses):
+                    s = _decode_ok(r)
+                    if s is not None:
+                        responses_ascii[bad_idx[j]] = s
+            except Exception as _e:
+                _LOGGER.debug("Retry of failed ASCII commands failed: %s", _e)
+
+        raw_qpigs  = responses_ascii[0]
+        raw_qpigs2 = responses_ascii[1]
+        raw_qmod   = responses_ascii[2]
+        raw_qpiws  = responses_ascii[3]
+        raw_qpiri  = responses_ascii[4]
 
         if not raw_qpigs or not raw_qmod:
             _LOGGER.debug("Invalid ASCII responses; continuing with partial data this cycle")
