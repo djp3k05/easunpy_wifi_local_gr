@@ -34,6 +34,15 @@ POPM_OPTIONS: Final[list[str]] = [
 MAX_CHARGING_CURRENT_OPTIONS: Final[list[str]] = [str(i) for i in range(10, 121, 10)]
 MAX_UTILITY_CHARGING_CURRENT_OPTIONS: Final[list[str]] = ['2'] + [str(i) for i in range(10, 121, 10)]
 
+# Helper
+def _fmt_one_decimal(value):
+    if value is None:
+        return None
+    try:
+        return f"{float(value):.1f}"
+    except Exception:
+        return None
+
 
 class _BaseSelect(SelectEntity):
     _attr_should_poll = False
@@ -216,7 +225,7 @@ class OutputModeSelect(_BaseSelect):
         _LOGGER.info("Set Output Mode -> %s", ok)
         if ok: await coord.update_data()
 
-# NEW ENTITIES
+# NEW ENTITIES (existing)
 class MaxChargingCurrentSelect(_BaseSelect):
     def __init__(self, coordinator: DataCollector):
         super().__init__(coordinator, "Max Charging Current", "max_charging_current", MAX_CHARGING_CURRENT_OPTIONS, decoder=lambda v: (str(int(float(v))) if v is not None else None))
@@ -241,10 +250,75 @@ class MaxUtilityChargingCurrentSelect(_BaseSelect):
         _LOGGER.info("Set Max Utility Charging Current -> %s", ok)
         if ok: await coord.update_data()
 
+# ---- NEW: voltage dropdown selects to replace sliders ----
+BULK_FLOAT_OPTIONS = [f"{i/10:.1f}" for i in range(480, 641)]  # 48.0 .. 64.0
+CUTOFF_OPTIONS = ["0.0"] + [f"{i/10:.1f}" for i in range(401, 541)]  # 0.0 + 40.1 .. 54.0
+RECHARGE_OPTIONS = ["0.0"] + [f"{i:.1f}" for i in range(44, 52)]     # 0.0 + 44.0 .. 51.0 (step 1.0)
+REDISCHARGE_OPTIONS = ["0.0"] + [f"{i:.1f}" for i in range(48, 65)]  # 0.0 + 48.0 .. 64.0 (step 1.0)
+
+class BatteryBulkVoltageSelect(_BaseSelect):
+    def __init__(self, coordinator: DataCollector):
+        super().__init__(coordinator, "Battery Bulk/CV Voltage", "battery_bulk_voltage", BULK_FLOAT_OPTIONS, decoder=_fmt_one_decimal)
+
+    async def async_select_option(self, option: str) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar: return
+        ok = await isolar.set_battery_bulk_voltage(float(option))
+        coord.update_last_command_status(ok)
+        _LOGGER.info("Set Battery Bulk/CV Voltage -> %s", ok)
+        if ok: await coord.update_data()
+
+class BatteryCutoffVoltageSelect(_BaseSelect):
+    def __init__(self, coordinator: DataCollector):
+        super().__init__(coordinator, "Battery Cut-Off Voltage", "battery_undervoltage", CUTOFF_OPTIONS, decoder=_fmt_one_decimal)
+
+    async def async_select_option(self, option: str) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar: return
+        ok = await isolar.set_battery_cutoff_voltage(float(option))
+        coord.update_last_command_status(ok)
+        _LOGGER.info("Set Battery Cut-Off Voltage -> %s", ok)
+        if ok: await coord.update_data()
+
+class BatteryFloatVoltageSelect(_BaseSelect):
+    def __init__(self, coordinator: DataCollector):
+        super().__init__(coordinator, "Battery Float Voltage", "battery_float_voltage", BULK_FLOAT_OPTIONS, decoder=_fmt_one_decimal)
+
+    async def async_select_option(self, option: str) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar: return
+        ok = await isolar.set_battery_float_voltage(float(option))
+        coord.update_last_command_status(ok)
+        _LOGGER.info("Set Battery Float Voltage -> %s", ok)
+        if ok: await coord.update_data()
+
+class BatteryRechargeVoltageSelect(_BaseSelect):
+    def __init__(self, coordinator: DataCollector):
+        super().__init__(coordinator, "Battery Re-Charge Voltage", "battery_recharge_voltage", RECHARGE_OPTIONS, decoder=_fmt_one_decimal)
+
+    async def async_select_option(self, option: str) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar: return
+        ok = await isolar.set_battery_recharge_voltage(float(option))
+        coord.update_last_command_status(ok)
+        _LOGGER.info("Set Battery Re-Charge Voltage -> %s", ok)
+        if ok: await coord.update_data()
+
+class BatteryRedischargeVoltageSelect(_BaseSelect):
+    def __init__(self, coordinator: DataCollector):
+        super().__init__(coordinator, "Battery Re-Discharge Voltage", "battery_redischarge_voltage", REDISCHARGE_OPTIONS, decoder=_fmt_one_decimal)
+
+    async def async_select_option(self, option: str) -> None:
+        isolar, coord = await self._get_isolar()
+        if not isolar: return
+        ok = await isolar.set_battery_redischarge_voltage(float(option))
+        coord.update_last_command_status(ok)
+        _LOGGER.info("Set Battery Re-Discharge Voltage -> %s", ok)
+        if ok: await coord.update_data()
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, add_entities: AddEntitiesCallback) -> None:
     coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
-    
     entities: list[SelectEntity] = [
         OutputSourcePrioritySelect(coordinator),
         ChargerSourcePrioritySelect(coordinator),
@@ -252,6 +326,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, add_entitie
         OutputModeSelect(coordinator),
         MaxChargingCurrentSelect(coordinator),
         MaxUtilityChargingCurrentSelect(coordinator),
+        # New voltage dropdowns
+        BatteryBulkVoltageSelect(coordinator),
+        BatteryCutoffVoltageSelect(coordinator),
+        BatteryFloatVoltageSelect(coordinator),
+        BatteryRechargeVoltageSelect(coordinator),
+        BatteryRedischargeVoltageSelect(coordinator),
     ]
     add_entities(entities)
     _LOGGER.debug("Select entities added")
