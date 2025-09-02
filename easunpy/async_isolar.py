@@ -557,18 +557,41 @@ class AsyncISolar:
     # ------------- ASCII setting helpers -------------
 
     async def _apply_ascii_setting(self, cmd: str) -> bool:
-        """Send a single ASCII setting command and return True on ACK."""
+        """Send a single ASCII setting command and return True on ACK.
+
+        Robust to stray/late frames: it selects the response whose TID matches the request TID.
+        """
         try:
             tid = self._get_next_transaction_id()
             pkt = create_ascii_request(tid, 0x0001, cmd)
             resps = await self.client.send_bulk([pkt])
-            resp = resps[0] if resps else None
-            ack = decode_ascii_response(resp) if resp else None
+
+            def _extract_tid(resp: bytes) -> int | None:
+                try:
+                    return (resp[0] << 8) | resp[1] if resp and len(resp) >= 2 else None
+                except Exception:
+                    return None
+
+            # Pick only the frame that matches our request TID
+            good = None
+            for r in (resps or []):
+                if _extract_tid(r) == tid:
+                    good = r
+                    break
+
+            if good is None:
+                # No matching response; likely a stray/late frame interleaved.
+                seen = [hex(_extract_tid(r) or -1) for r in (resps or [])]
+                _LOGGER.debug(f"apply_setting({cmd}): no matching TID={hex(tid)}, seen TIDs={seen}")
+                return False
+
+            ack = decode_ascii_response(good)
             _LOGGER.debug(f"apply_setting({cmd}) -> {ack}")
             return bool(ack) and ack.startswith("(ACK")
         except Exception as e:
             _LOGGER.debug(f"apply_setting({cmd}) failed: {e}")
             return False
+
 
     async def set_max_utility_charging_current(self, amps: int) -> bool:
         """MUCHGC: AC utility charging current (4-digit, zero-padded). E.g., 2 -> MUCHGC0002, 20 -> MUCHGC0020."""
