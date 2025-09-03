@@ -61,6 +61,19 @@ class DataCollector:
         except Exception:
             _LOGGER.debug("Failed to register entity", exc_info=True)
 
+    # NEW: immediate push to sensors (used by update_last_command_status)
+    def _notify_sensors(self) -> None:
+        """Push current cache into all registered sensors immediately."""
+        try:
+            for sensor in self._sensors:
+                try:
+                    sensor.update_from_collector()
+                    sensor.async_write_ha_state()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def update_last_command_status(self, ok: bool, command: str | None = None) -> None:
         """Store last command ACK/NAK and push-update the dedicated sensor."""
         try:
@@ -72,16 +85,12 @@ class DataCollector:
             self._data.setdefault('system', {})
             self._stable['system']['last_command_response'] = msg
             self._data['system']['last_command_response'] = msg
+            # Immediately push to sensors and entities
+            self._notify_sensors()
             try:
-                if hasattr(self, '_notify_sensors'):
-                    self._notify_sensors()
-            except Exception:
-                pass
-            try:
-                if hasattr(self, '_entities'):
-                    for ent in self._entities:
-                        if hasattr(ent, 'update_from_collector'):
-                            ent.update_from_collector()
+                for ent in self._entities:
+                    if hasattr(ent, 'update_from_collector'):
+                        ent.update_from_collector()
             except Exception:
                 pass
             _LOGGER.debug("Last command response updated: %s", msg)
