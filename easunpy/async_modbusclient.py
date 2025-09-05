@@ -16,7 +16,8 @@ import time
 from typing import List, Optional, Tuple, Union
 
 # Optional spacing between commands to accommodate slower Wi-Fi / device processing
-INTER_COMMAND_DELAY: float = 0.300  # seconds
+# Increased delay slightly as a secondary safety measure.
+INTER_COMMAND_DELAY: float = 0.400  # seconds
 
 _LOGGER = logging.getLogger("easunpy.async_modbusclient")
 
@@ -217,8 +218,25 @@ class AsyncModbusClient:
                 _LOGGER.debug("No inverter connection yet; skipping this cycle")
                 return [None for _ in requests]
 
-            results: List[Optional[bytes]] = []
             assert self._reader and self._writer
+
+            # **FIX**: Drain any stale data from the read buffer before sending new commands.
+            # This prevents reading a late response from a previous, timed-out command.
+            try:
+                while True:
+                    # Use a very short timeout. A timeout here is normal and means the buffer is empty.
+                    stale_data = await asyncio.wait_for(self._reader.read(1024), timeout=0.05)
+                    if not stale_data:
+                        break  # End of stream, connection likely closed.
+                    _LOGGER.debug(f"Drained stale data from read buffer: {stale_data.hex()}")
+            except asyncio.TimeoutError:
+                # This is the expected case when the buffer is clean.
+                pass
+            except Exception as e:
+                # Log other potential errors during the drain.
+                _LOGGER.warning(f"Exception while draining stale data: {e}")
+
+            results: List[Optional[bytes]] = []
             for req in requests:
                 try:
                     req_bytes = _to_bytes(req)
@@ -238,8 +256,8 @@ class AsyncModbusClient:
                 except Exception as exc:
                     _LOGGER.error("Transport error: %s", exc, exc_info=False)
                     results.append(None)
-
-                # Add a small delay to give the inverter time to process, preventing TID mismatches.
+                
+                # The delay between commands is still useful for slower inverters.
                 await asyncio.sleep(INTER_COMMAND_DELAY)
             return results
 
