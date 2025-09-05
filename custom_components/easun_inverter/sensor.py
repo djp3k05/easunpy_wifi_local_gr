@@ -78,7 +78,10 @@ class DataCollector:
         """Store last command ACK/NAK and push-update the dedicated sensor."""
         try:
             status = "ACK" if ok else "NAK"
-            msg = f"{status}{f' {command}' if command else ''}"
+            # Add a timestamp to ensure the state string is always unique, forcing updates.
+            timestamp = datetime.now().strftime('%H:%M:%S')
+            msg = f"{status} @ {timestamp}"
+            
             if not hasattr(self, '_stable'):
                 self._stable = {'battery': {}, 'pv': {}, 'grid': {}, 'output': {}, 'system': {}}
             self._stable.setdefault('system', {})

@@ -238,10 +238,9 @@ class AsyncModbusClient:
                 except Exception as exc:
                     _LOGGER.error("Transport error: %s", exc, exc_info=False)
                     results.append(None)
-                
-                # ** THE FIX IS HERE **
-                # Add a small delay to give the inverter time to process
-                await asyncio.sleep(0.3)
+
+                # Add a small delay to give the inverter time to process, preventing TID mismatches.
+                await asyncio.sleep(INTER_COMMAND_DELAY)
             return results
 
     async def send_ascii_command(self, ascii_command_packet: Union[bytes, str], timeout: float = 5.0) -> Optional[bytes]:
