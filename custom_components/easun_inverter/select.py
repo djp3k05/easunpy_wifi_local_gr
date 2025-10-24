@@ -19,7 +19,13 @@ _LOGGER = logging.getLogger(__name__)
 
 # Static option sets
 POP_OPTIONS: Final[list[str]] = ["UtilitySolarBat", "SolarUtilityBat", "SolarBatUtility"]
-PCP_OPTIONS: Final[list[str]] = ["Solar first", "Solar + Utility", "Only solar charging"]
+# MODIFIED: Updated PCP_OPTIONS list
+PCP_OPTIONS: Final[list[str]] = [
+    "Utility first",
+    "Solar first",
+    "Solar and utility simultaneously",
+    "Solar only",
+]
 PGR_OPTIONS: Final[list[str]] = ["Appliance", "UPS"]
 POPM_OPTIONS: Final[list[str]] = [
     "Single machine output",
