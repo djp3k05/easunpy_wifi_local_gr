@@ -1,4 +1,3 @@
-
 import logging
 from typing import Optional, Dict, Tuple, Any, List
 from .async_modbusclient import AsyncModbusClient
@@ -121,8 +120,14 @@ class AsyncISolar:
         def map_machine_type(code: str) -> str:
             return {"00": "Grid tie", "01": "Off Grid", "10": "Hybrid"}.get(code, code)
 
+        # MODIFIED: Updated map_charger_priority helper
         def map_charger_priority(code: str) -> str:
-            return {"1": "Solar first", "2": "Solar + Utility", "3": "Only solar charging"}.get(code, code)
+            return {
+                "0": "Utility first",
+                "1": "Solar first",
+                "2": "Solar and utility simultaneously",
+                "3": "Solar only",
+            }.get(code, code)
 
         def map_output_mode(code: str) -> str:
             return {
@@ -627,12 +632,14 @@ class AsyncISolar:
             return False
         return await self._apply_ascii_setting(code)
 
+    # MODIFIED: Updated set_charger_source_priority mapping
     async def set_charger_source_priority(self, option: str) -> bool:
         """PCP: Charger Source Priority from friendly label."""
         mapping = {
-            "Solar first": "PCP03",
-            "Solar + Utility": "PCP02",
-            "Only solar charging": "PCP00",
+            "Utility first": "PCP00",
+            "Solar first": "PCP01",
+            "Solar and utility simultaneously": "PCP02",
+            "Solar only": "PCP03",
         }
         code = mapping.get(option)
         if not code:
