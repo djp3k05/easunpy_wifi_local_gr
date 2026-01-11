@@ -9,8 +9,8 @@
   "issue_tracker": "https://github.com/djp3k05/Easun-Local-Wifi/issues",
   "requirements": [
     "dataclasses>=0.6",
-    "git+https://github.com/djp3k05/easunpy_wifi_local_gr.git@main#egg=easunpy",
+    "easunpy @ git+https://github.com/djp3k05/easunpy_wifi_local_gr.git@main",
     "aiofiles>=23.2.1"
   ],
-  "version": "3.28.17"
+  "version": "3.28.18"
   }
